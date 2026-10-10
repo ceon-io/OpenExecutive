@@ -64,6 +64,22 @@ _DEFAULT_OPENROUTER_CATALOG_PROVIDERS: tuple[str, ...] = (
     "deepseek",
     "x-ai",
 )
+# Gemini ids served by Google's Gemini API when GEMINI_MODELS is unset.
+# Newest first: the first entry is what an Anthropic-free Gemini deployment
+# runs every model setting on. Lives here (not in providers/) so the
+# Settings defaults and providers.registry read the same list.
+_DEFAULT_GEMINI_MODELS: tuple[str, ...] = (
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+)
+# The model settings whose Claude defaults a Gemini-only deployment replaces
+# (Settings._gemini_as_primary). One the operator set explicitly is left alone.
+_GEMINI_PRIMARY_MODEL_FIELDS: tuple[str, ...] = (
+    "default_model",
+    "deep_reasoning_model",
+    "routing_model",
+    "research_model",
+)
 # Six hours: OpenRouter adds models a few times a month, so anything tighter
 # is wasted requests; a restart also refreshes.
 _DEFAULT_OPENROUTER_CATALOG_REFRESH_S = 6 * 60 * 60.0
@@ -261,6 +277,46 @@ class Settings(BaseSettings):
             )
         return self
 
+    # ---- Google Gemini (direct) ----------------------------------------
+    # Route Gemini model ids (``gemini-3.8-flash``, …) straight to Google's
+    # Gemini API through its OpenAI-compatible endpoint, billed to your Google
+    # AI Studio key. With this on and no Anthropic key, the model settings
+    # default to the first entry of GEMINI_MODELS, so the whole application
+    # runs on Gemini without pointing each model setting at it by hand.
+    # Default OFF so a fresh checkout's behavior is identical to before.
+    gemini_enabled: bool = Field(False, alias="GEMINI_ENABLED")
+    gemini_api_key: str | None = Field(None, alias="GEMINI_API_KEY")
+    # The OpenAI-compatible endpoint of the Gemini API. Override only for a
+    # gateway that speaks the same format in front of it.
+    gemini_base_url: str = Field(
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+        alias="GEMINI_BASE_URL",
+    )
+    # Comma-separated Gemini model ids offered in the Council UI. The first
+    # one is the default for every model setting when no Anthropic key is
+    # set. Any other ``gemini-*`` id (an override stored in the Council, or a
+    # newer release set via env) routes to Gemini too.
+    gemini_models: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: list(_DEFAULT_GEMINI_MODELS),
+        alias="GEMINI_MODELS",
+    )
+    gemini_timeout_s: float = Field(180.0, alias="GEMINI_TIMEOUT_S")
+
+    @field_validator("gemini_models", mode="before")
+    @classmethod
+    def _parse_gemini_models(cls, v: Any) -> list[str]:
+        # An explicitly empty value falls back to the default set rather than
+        # surfacing zero Gemini models (which would blank the dropdown).
+        return _parse_csv_list(v) or list(_DEFAULT_GEMINI_MODELS)
+
+    @model_validator(mode="after")
+    def _validate_gemini(self) -> "Settings":
+        # Enabling the toggle without a key would silently 401 every call.
+        # Fail loud at startup instead.
+        if self.gemini_enabled and not self.gemini_api_key:
+            raise ValueError("GEMINI_ENABLED=true requires GEMINI_API_KEY to be set")
+        return self
+
     # ---- Local / self-hosted models ------------------------------------
     # Route selected model slugs to a local OpenAI-compatible server
     # (Ollama, LM Studio, vLLM, llama.cpp, …) instead of the Anthropic API.
@@ -343,13 +399,35 @@ class Settings(BaseSettings):
         if not (
             self.anthropic_api_key
             or self.openrouter_enabled
+            or self.gemini_enabled
             or self.local_models_enabled
         ):
             raise ValueError(
                 "No LLM provider configured. Set ANTHROPIC_API_KEY, or enable "
+                "Gemini (GEMINI_ENABLED=true + GEMINI_API_KEY), or enable "
                 "OpenRouter (OPENROUTER_ENABLED=true + OPENROUTER_API_KEY), or "
                 "enable local models (LOCAL_MODELS_ENABLED=true + LOCAL_BASE_URL)."
             )
+        return self
+
+    @model_validator(mode="after")
+    def _gemini_as_primary(self) -> "Settings":
+        """Run everything on Gemini when it is the only hosted provider.
+
+        The model settings default to Claude ids. With GEMINI_ENABLED on and
+        nothing that can serve a Claude id (no ANTHROPIC_API_KEY, OpenRouter
+        off), those defaults would 400 on the first call, so the ones the
+        operator did not set explicitly become the first GEMINI_MODELS entry.
+        An install with an Anthropic key keeps Claude as the default and
+        makes Gemini primary by setting DEFAULT_MODEL (and the others) to a
+        Gemini id.
+        """
+        if not self.gemini_enabled or self.anthropic_api_key or self.openrouter_enabled:
+            return self
+        primary = self.gemini_models[0]
+        for name in _GEMINI_PRIMARY_MODEL_FIELDS:
+            if name not in self.model_fields_set:
+                setattr(self, name, primary)
         return self
 
     # ---- Update check ---------------------------------------------------

@@ -3228,7 +3228,7 @@ export interface ModelOption {
   id: string;
   provider: string;
   provider_label: string;
-  route: "direct" | "openrouter" | "local";
+  route: "direct" | "gemini" | "openrouter" | "local";
   label: string;
 }
 

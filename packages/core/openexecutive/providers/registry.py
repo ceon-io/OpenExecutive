@@ -2,8 +2,9 @@
 
 This module is the single source of truth for: what we ship to the
 Council UI (``allowed_models``), how a Claude model name maps to its
-OpenRouter slug (``openrouter_slug_for_claude``), and which Anthropic-only
-features each model tolerates. ``get_provider(model)`` picks the backend
+OpenRouter slug (``openrouter_slug_for_claude``), which ids the Gemini API
+serves directly (``GEMINI_ENABLED``), and which Anthropic-only features each
+model tolerates. ``get_provider(model)`` picks the backend
 per call so the user can flip an agent's model in the Council UI and have
 requests for that agent — and only that agent — route differently.
 
@@ -20,10 +21,11 @@ from typing import Any, Literal, TypedDict
 
 from fastapi import HTTPException
 
-from openexecutive.config import get_settings
+from openexecutive.config import _DEFAULT_GEMINI_MODELS, get_settings
 from openexecutive.providers import openrouter_catalog
 from openexecutive.providers.anthropic_provider import AnthropicProvider
 from openexecutive.providers.feature_gate import FeatureSpec
+from openexecutive.providers.gemini_provider import GeminiProvider
 from openexecutive.providers.openai_compatible import OpenAICompatibleProvider
 from openexecutive.providers.openrouter_provider import OpenRouterProvider
 from openexecutive.providers.provider import LLMProvider
@@ -39,6 +41,11 @@ ANTHROPIC_DIRECT_MODELS: list[str] = [
     "claude-haiku-5-5",
     "claude-haiku-4-5",
 ]
+
+# Gemini ids served straight by Google's Gemini API when GEMINI_ENABLED is
+# on. The live list is ``Settings.gemini_models`` (GEMINI_MODELS); this is
+# its default, re-exported here next to the other model constants.
+GEMINI_DIRECT_MODELS: list[str] = list(_DEFAULT_GEMINI_MODELS)
 
 # Hardcoded FALLBACK for the non-Anthropic OpenRouter set. The live list
 # comes from ``providers.openrouter_catalog`` (fetched from OpenRouter's
@@ -81,6 +88,12 @@ _CLAUDE_ID_RE = re.compile(
 # Slugs on the OpenRouter side that are Claude models (either derived from an
 # Anthropic id above, or listed verbatim by the live catalog).
 _OPENROUTER_CLAUDE_PREFIX = "anthropic/claude-"
+# A Gemini API model id (``gemini-3.8-flash``, ``gemini-3.5-flash-lite``, a
+# dated or preview build). No vendor prefix: the OpenRouter slug for the same
+# model is ``google/<id>``, which is how a Gemini id routes when Gemini direct
+# is off but OpenRouter is on.
+_GEMINI_ID_RE = re.compile(r"^gemini-[a-z0-9][a-z0-9.-]*$")
+_OPENROUTER_GOOGLE_PREFIX = "google/"
 _HAIKU_FAMILY = "haiku"
 
 
@@ -172,6 +185,16 @@ _LOCAL_FEATURE_SPEC = FeatureSpec(
 )
 
 
+def _gemini_models(settings: Any) -> list[str]:
+    """Configured Gemini ids, or ``[]`` when Gemini direct is off.
+
+    Read defensively: lightweight test settings stubs may omit the field.
+    """
+    if not getattr(settings, "gemini_enabled", False):
+        return []
+    return list(getattr(settings, "gemini_models", None) or GEMINI_DIRECT_MODELS)
+
+
 def _local_models(settings: Any) -> list[str]:
     """Configured local model slugs, or ``[]`` when local routing is off.
 
@@ -206,6 +229,7 @@ def allowed_models() -> list[str]:
 
     * Anthropic-direct trio — when an ``ANTHROPIC_API_KEY`` is set, OR when
       ``OPENROUTER_ENABLED`` is on (Claude is then reachable via OpenRouter).
+    * Gemini ids (``GEMINI_MODELS``) — when ``GEMINI_ENABLED`` is on.
     * OpenRouter set (live catalog or fallback) — when ``OPENROUTER_ENABLED``
       is on.
     * Local models — when ``LOCAL_MODELS_ENABLED`` is on.
@@ -214,6 +238,7 @@ def allowed_models() -> list[str]:
     models: list[str] = []
     if getattr(settings, "anthropic_api_key", None) or settings.openrouter_enabled:
         models.extend(ANTHROPIC_DIRECT_MODELS)
+    models.extend(_gemini_models(settings))
     if settings.openrouter_enabled:
         models.extend(openrouter_models())
     models.extend(_local_models(settings))
@@ -252,7 +277,7 @@ _OPENROUTER_CLAUDE_SLUG_RE = re.compile(
 )
 
 
-ModelRoute = Literal["direct", "openrouter", "local"]
+ModelRoute = Literal["direct", "gemini", "openrouter", "local"]
 
 
 class ModelOption(TypedDict):
@@ -272,15 +297,35 @@ def _claude_label(model: str) -> str | None:
     return f"Claude {m.group('family').capitalize()} {m.group('version')}"
 
 
-def _model_option(model: str, *, local: bool, openrouter_enabled: bool) -> ModelOption:
+# ``gemini-3.8-flash`` → family ``3.8``, variant ``flash``;
+# ``gemini-3.5-flash-lite`` → ``3.5``, ``flash-lite``.
+_GEMINI_LABEL_RE = re.compile(r"^gemini-(?P<version>\d+(?:\.\d+)?)-(?P<variant>[a-z0-9-]+)$")
+
+
+def _gemini_label(model: str) -> str | None:
+    """``gemini-3.8-flash`` / ``google/gemini-3.8-flash`` → ``Gemini 3.8 Flash``."""
+    m = _GEMINI_LABEL_RE.match(model.removeprefix(_OPENROUTER_GOOGLE_PREFIX))
+    if m is None:
+        return None
+    variant = " ".join(part.capitalize() for part in m.group("variant").split("-"))
+    return f"Gemini {m.group('version')} {variant}"
+
+
+def _model_option(
+    model: str, *, local: bool, gemini: bool, openrouter_enabled: bool
+) -> ModelOption:
     """Provider grouping + display name for one allowlisted model.
 
-    ``route`` mirrors ``get_provider``: local slugs stay local, Claude ids
-    go direct unless OpenRouter is on, everything else is OpenRouter.
+    ``route`` mirrors ``get_provider``: local slugs stay local, Gemini ids go
+    to the Gemini API when it is on, Claude ids go direct unless OpenRouter
+    is on, everything else is OpenRouter.
     """
     route: ModelRoute
     if local:
         provider, route, label = "local", "local", model
+    elif gemini:
+        provider, route = "google", "gemini"
+        label = _gemini_label(model) or model
     elif _is_claude(model):
         provider = "anthropic"
         route = "openrouter" if openrouter_enabled else "direct"
@@ -289,7 +334,12 @@ def _model_option(model: str, *, local: bool, openrouter_enabled: bool) -> Model
         vendor, sep, name = model.partition("/")
         provider = vendor if sep else "other"
         route = "openrouter"
-        label = (_claude_label(model) if provider == "anthropic" else None) or name or model
+        label = (
+            (_claude_label(model) if provider == "anthropic" else None)
+            or (_gemini_label(model) if provider == "google" else None)
+            or name
+            or model
+        )
     return {
         "id": model,
         "provider": provider,
@@ -306,9 +356,13 @@ def model_options_for(agent_id: str | None) -> list[ModelOption]:
     """
     settings = get_settings()
     local = set(_local_models(settings))
+    gemini_on = bool(getattr(settings, "gemini_enabled", False))
     return [
         _model_option(
-            m, local=m in local, openrouter_enabled=bool(settings.openrouter_enabled)
+            m,
+            local=m in local,
+            gemini=gemini_on and m not in local and _is_gemini(m),
+            openrouter_enabled=bool(settings.openrouter_enabled),
         )
         for m in allowed_models_for(agent_id)
     ]
@@ -324,10 +378,22 @@ def _is_claude(model: str) -> bool:
     return _CLAUDE_ID_RE.match(model) is not None
 
 
+def _is_gemini(model: str) -> bool:
+    """A Gemini API id: anything in ``GEMINI_MODELS`` or shaped like one.
+
+    Overrides persisted in SQLite may name a Gemini release that is no longer
+    listed; those must keep routing to the Gemini API rather than falling
+    through to OpenRouter as a bare slug it does not know.
+    """
+    return _GEMINI_ID_RE.match(model) is not None or model in _gemini_models(get_settings())
+
+
 def _openrouter_model_resolver(model: str) -> tuple[str, FeatureSpec] | None:
     """Slug + feature spec for a model on the OpenRouter path.
 
     * Anthropic id (``claude-sonnet-5``) → derived OpenRouter slug, Claude spec.
+    * Gemini API id (``gemini-3.8-flash``, Gemini direct off) → OpenRouter's
+      ``google/`` slug for it, with the spec its catalog entry earns.
     * Verbatim Claude slug from the catalog (``anthropic/claude-opus-4.8``) →
       unchanged, Claude spec — OpenRouter forwards cache_control / thinking
       to Anthropic for these, so stripping them would only cost money.
@@ -342,6 +408,8 @@ def _openrouter_model_resolver(model: str) -> tuple[str, FeatureSpec] | None:
         return slug, _CLAUDE_FEATURE_SPEC
     if model.startswith(_OPENROUTER_CLAUDE_PREFIX):
         return model, _CLAUDE_FEATURE_SPEC
+    if _GEMINI_ID_RE.match(model):
+        model = _OPENROUTER_GOOGLE_PREFIX + model
     # Non-Claude: the live catalog knows whether OpenRouter will honour a
     # ``reasoning`` request for this slug. Unknown (fallback list, or a slug
     # outside the catalog) keeps the conservative thinking-off default.
@@ -355,6 +423,7 @@ def _openrouter_model_resolver(model: str) -> tuple[str, FeatureSpec] | None:
 _anthropic_provider: AnthropicProvider | None = None
 _openrouter_provider: OpenRouterProvider | None = None
 _local_provider: OpenAICompatibleProvider | None = None
+_gemini_provider: GeminiProvider | None = None
 
 
 def _anthropic() -> AnthropicProvider:
@@ -379,6 +448,28 @@ def _anthropic() -> AnthropicProvider:
             workspace_id=getattr(settings, "anthropic_workspace_id", None),
         )
     return _anthropic_provider
+
+
+def _gemini() -> GeminiProvider:
+    global _gemini_provider
+    if _gemini_provider is None:
+        settings = get_settings()
+        api_key = getattr(settings, "gemini_api_key", None)
+        if not api_key:
+            # The Settings model_validator already prevents GEMINI_ENABLED
+            # without a key, but defense in depth — a misconfigured env could
+            # otherwise produce a request with no bearer token.
+            raise HTTPException(
+                status_code=400,
+                detail="Gemini routing requires GEMINI_API_KEY",
+            )
+        _gemini_provider = GeminiProvider(
+            api_key=api_key,
+            base_url=getattr(settings, "gemini_base_url", None)
+            or "https://generativelanguage.googleapis.com/v1beta/openai",
+            timeout_s=getattr(settings, "gemini_timeout_s", 180.0),
+        )
+    return _gemini_provider
 
 
 def _local() -> OpenAICompatibleProvider:
@@ -455,6 +546,10 @@ def get_provider(model: str) -> LLMProvider:
     * Local models (slugs listed in ``LOCAL_MODELS`` with
       ``LOCAL_MODELS_ENABLED`` on) — the self-hosted OpenAI-compatible
       backend at ``LOCAL_BASE_URL``. Always wins for its configured slugs.
+    * Gemini ids (``gemini-<version>-<variant>``, or anything listed in
+      ``GEMINI_MODELS``) — the Gemini API when ``GEMINI_ENABLED`` is on;
+      otherwise OpenRouter under its ``google/`` slug, like any other
+      non-Claude model.
     * Claude family (any ``claude-<family>-<version>`` id) — Anthropic
       direct by default; OpenRouter when ``OPENROUTER_ENABLED`` is on.
     * Other non-Claude (anything from ``openrouter_models()``, or any
@@ -469,19 +564,26 @@ def get_provider(model: str) -> LLMProvider:
     # to a hosted vendor.
     if model in _local_models(settings):
         return _local()
+    if getattr(settings, "gemini_enabled", False) and _is_gemini(model):
+        return _gemini()
     if _is_claude(model):
         if settings.openrouter_enabled:
             return _openrouter()
         return _anthropic()
     # Other non-Claude slugs require OpenRouter to be enabled.
     if not settings.openrouter_enabled:
+        gemini_hint = (
+            "enable Gemini (GEMINI_ENABLED=true + GEMINI_API_KEY), or "
+            if _GEMINI_ID_RE.match(model)
+            else ""
+        )
         raise HTTPException(
             status_code=400,
             detail=(
                 f"Model {model!r} requires OPENROUTER_ENABLED=true (set "
-                f"OPENROUTER_API_KEY and toggle the flag), or list it in "
-                f"LOCAL_MODELS with LOCAL_MODELS_ENABLED=true to serve it "
-                f"from a local OpenAI-compatible backend."
+                f"OPENROUTER_API_KEY and toggle the flag), or {gemini_hint}"
+                f"list it in LOCAL_MODELS with LOCAL_MODELS_ENABLED=true to "
+                f"serve it from a local OpenAI-compatible backend."
             ),
         )
     return _openrouter()
@@ -491,14 +593,18 @@ def pdf_input_supported(model: str) -> bool:
     """Whether a PDF ``document`` block sent to ``model`` reaches a reader.
 
     Mirrors ``get_provider``'s routing without building anything: a local
-    slug reads PDFs only with LOCAL_PDF_INPUT; a Claude id reads them
-    natively on Anthropic (when a key is set) or through OpenRouter; any
-    other slug goes to OpenRouter, whose file-parser handles every model.
-    False when the model has no reachable provider at all.
+    slug reads PDFs only with LOCAL_PDF_INPUT; a Gemini id on the Gemini API
+    never does (its OpenAI-compatible layer takes no file part, so the PDF
+    is OCR'd locally); a Claude id reads them natively on Anthropic (when a
+    key is set) or through OpenRouter; any other slug goes to OpenRouter,
+    whose file-parser handles every model. False when the model has no
+    reachable provider at all.
     """
     settings = get_settings()
     if model in _local_models(settings):
         return bool(getattr(settings, "local_pdf_input", False))
+    if getattr(settings, "gemini_enabled", False) and _is_gemini(model):
+        return False
     if settings.openrouter_enabled:
         return True
     return _is_claude(model) and bool(settings.anthropic_api_key)
@@ -506,7 +612,8 @@ def pdf_input_supported(model: str) -> bool:
 
 def _reset_for_tests() -> None:
     """Drop cached provider singletons. Test-only — pytest fixtures call this."""
-    global _anthropic_provider, _openrouter_provider, _local_provider
+    global _anthropic_provider, _openrouter_provider, _local_provider, _gemini_provider
     _anthropic_provider = None
     _openrouter_provider = None
     _local_provider = None
+    _gemini_provider = None

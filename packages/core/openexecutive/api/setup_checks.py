@@ -191,6 +191,7 @@ async def check_ai_model(snap: Snapshot) -> SetupCheck:
         using = " and ".join(
             name
             for name, on in (
+                ("Gemini", settings.gemini_enabled),
                 ("OpenRouter", settings.openrouter_enabled),
                 ("local models", settings.local_models_enabled),
             )

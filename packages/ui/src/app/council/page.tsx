@@ -80,11 +80,14 @@ function unlistedOption(id: string, known: ModelOption[]): PickerOption {
   const slash = id.indexOf("/");
   const provider = /^(anthropic\/)?claude-/i.test(id)
     ? "anthropic"
-    : slash > 0
-      ? id.slice(0, slash)
-      : "other";
+    : /^(google\/)?gemini-/i.test(id)
+      ? "google"
+      : slash > 0
+        ? id.slice(0, slash)
+        : "other";
   const sibling = known.find((o) => o.provider === provider);
-  const fallbackLabel = provider === "anthropic" ? "Anthropic" : provider === "other" ? "Other" : provider;
+  const fallbackLabel =
+    provider === "anthropic" ? "Anthropic" : provider === "google" ? "Google" : provider === "other" ? "Other" : provider;
   return {
     id,
     provider,
@@ -97,6 +100,7 @@ function unlistedOption(id: string, known: ModelOption[]): PickerOption {
 
 const ROUTE_TEXT: Record<ModelOption["route"], string> = {
   direct: "Anthropic API",
+  gemini: "Gemini API",
   openrouter: "via OpenRouter",
   local: "local backend",
 };

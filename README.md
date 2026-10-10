@@ -370,9 +370,10 @@ The deployed UI is gated behind Google sign-in or SSO sign-in (any OpenID Connec
 ## Configuration
 
 All settings via environment variables. Minimum required: `ANTHROPIC_API_KEY` —
-*unless* you configure a local or OpenRouter backend instead (see [Running on
-Local Models](#running-on-local-models)). At least one provider must be set or
-the app refuses to start.
+*unless* you configure Gemini, OpenRouter or a local backend instead (see
+[Running on Gemini](#running-on-gemini) and [Running on Local
+Models](#running-on-local-models)). At least one provider must be set or the
+app refuses to start.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -421,6 +422,11 @@ the app refuses to start.
 | `CONFLUENCE_SYNC_SPACE_KEYS` | No | — | Comma-separated space keys to sync |
 | `NOTION_SYNC_ENABLED` | No | `false` | Sync the Notion pages shared with your integration into the knowledge base |
 | `NOTION_API_KEY` | No | — | Notion internal integration token |
+| `GEMINI_ENABLED` | No | `false` | Route Gemini model ids straight to Google's Gemini API (OpenAI-compatible endpoint) and list them in the Council UI |
+| `GEMINI_API_KEY` | No | — | Required when `GEMINI_ENABLED=true` |
+| `GEMINI_MODELS` | No | `gemini-3.8-flash,gemini-3.5-flash-lite` | Gemini ids offered in the Council UI; the first is the default for every model setting on a Gemini-only install |
+| `GEMINI_BASE_URL` | No | `https://generativelanguage.googleapis.com/v1beta/openai` | Override only for a gateway that speaks the same format in front of Gemini |
+| `GEMINI_TIMEOUT_S` | No | `180` | Per-request timeout for Gemini calls, in seconds |
 | `OPENROUTER_ENABLED` | No | `false` | Route Claude calls through OpenRouter and unlock non-Anthropic models per-agent in the Council UI |
 | `OPENROUTER_API_KEY` | No | — | Required when `OPENROUTER_ENABLED=true` |
 | `OPENROUTER_CATALOG_ENABLED` | No | `true` | Fetch OpenRouter's live `/models` catalog at startup to populate the Council dropdown; falls back to a built-in list on failure |
@@ -441,7 +447,7 @@ the app refuses to start.
 
 See [.env.example](.env.example) for the full list.
 
-> ¹ `ANTHROPIC_API_KEY` is required only when you serve Claude models directly.
+> ¹ `ANTHROPIC_API_KEY` is required only when you serve Claude models directly. A Gemini-only (`GEMINI_ENABLED`), OpenRouter-only or local-only install boots without it.
 > It can be omitted entirely if you run on local models (`LOCAL_MODELS_ENABLED`)
 > or route through OpenRouter (`OPENROUTER_ENABLED`).
 
@@ -452,6 +458,38 @@ See [.env.example](.env.example) for the full list.
 > `web_search` tool, so it applies to Claude models (local models can't use
 > it). `WEB_SEARCH_ALLOWED_DOMAINS` / `WEB_SEARCH_BLOCKED_DOMAINS` scope where
 > it may look (set at most one).
+
+## Running on Gemini
+
+Open Executive can run on **Google Gemini** as its primary model, with no
+Anthropic key at all. Gemini model ids route straight to the Gemini API through
+its OpenAI-compatible endpoint, via the same provider abstraction every other
+backend uses; no agent or orchestrator code changes.
+
+```bash
+# In .env — a Google AI Studio key is all it takes
+GEMINI_ENABLED=true
+GEMINI_API_KEY=AIza...
+# ...and leave ANTHROPIC_API_KEY unset
+```
+
+With no Anthropic key and OpenRouter off, every model setting
+(`DEFAULT_MODEL`, `DEEP_REASONING_MODEL`, `ROUTING_MODEL`, `RESEARCH_MODEL`)
+defaults to the first entry of `GEMINI_MODELS` — `gemini-3.8-flash`, the
+latest Flash model — so the Executive, every specialist, triage and the
+background helpers all run on Gemini. If you also keep an Anthropic key,
+Claude stays the default and you make Gemini primary by setting those four
+model settings to a Gemini id yourself. Either way the Gemini ids appear in
+the **Council UI** dropdown under **Google**, so a hybrid setup (the Executive
+on Gemini, a specialist on Claude, or the reverse) is a per-agent flip.
+
+**Caveats.** Server-side web search (`ENABLE_WEB_SEARCH`) and Anthropic prompt
+caching are Anthropic features and are off for Gemini-direct calls. The
+Council's **Deep reasoning** toggle is honoured: it becomes Gemini's
+`reasoning_effort`. Scanned PDFs are OCR'd locally rather than sent to the
+model. A `gemini-*` id with `GEMINI_ENABLED=false` still works when
+`OPENROUTER_ENABLED=true` — it routes through OpenRouter under its `google/`
+slug, where web search is available again.
 
 ## Running on Local Models
 

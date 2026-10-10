@@ -11,14 +11,21 @@ completion, which is the correct "does this prompt produce sensible output?" che
 from __future__ import annotations
 
 from openexecutive.agents.base import BaseAgent
+from openexecutive.config import get_settings
 
 
 class ExecutiveProxy(BaseAgent):
     name = "executive"
     domain = "orchestration"
     visibility = "core"
-    model = "claude-sonnet-5-5"  # matches DEFAULT_MODEL default
     use_deep_reasoning = False
+
+    @property
+    def model(self) -> str:  # type: ignore[override]
+        # What the chat Executive actually runs on (executive.py reads the
+        # same setting), so the Council shows the real default and a
+        # Gemini-only install's test box does not call a Claude id.
+        return get_settings().default_model
 
     def get_system_prompt(self) -> str:
         # The built-in persona for this install's workspace mode (team / solo).

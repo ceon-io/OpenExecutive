@@ -53,7 +53,7 @@ class ModelOption(BaseModel):
     id: str
     provider: str
     provider_label: str
-    route: Literal["direct", "openrouter", "local"]
+    route: Literal["direct", "gemini", "openrouter", "local"]
     label: str
 
 

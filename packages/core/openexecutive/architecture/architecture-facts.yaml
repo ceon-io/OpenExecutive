@@ -73,11 +73,43 @@ system:
       spend the whole max_tokens budget reasoning and return no tool call —
       the onboarding interview then fails with "did not return a usable
       response".
+      When GEMINI_ENABLED=true (plus GEMINI_API_KEY), Gemini model ids
+      (``gemini-3.8-flash``, ``gemini-3.5-flash-lite``, any ``gemini-*`` id
+      or anything listed in GEMINI_MODELS) route straight to Google's
+      Gemini API through its OpenAI-compatible endpoint
+      (providers.gemini_provider.GeminiProvider, a subclass of the same
+      OpenAICompatibleProvider engine), billed to the operator's Google AI
+      Studio key. Those ids are added to the Council UI dropdown under the
+      Google group with route "gemini". Their feature spec keeps thinking
+      (the Council deep-reasoning toggle becomes Gemini's top-level
+      ``reasoning_effort`` low/medium/high, folded from the wider
+      Anthropic/OpenRouter ladder; a legacy token budget becomes the Google
+      ``thinking_config.thinking_budget`` extension) and strips the rest:
+      no cache_control, no Anthropic web-search server tool (Gemini's
+      OpenAI layer cannot run it, so a Gemini-direct agent does not
+      search), no PDF file part (a PDF becomes a note and pdf_reader OCRs
+      it locally). A forced ``tool_choice: any`` is sent as OpenAI's
+      ``required``; the OpenRouter-only ``usage`` accounting field and
+      ``reasoning`` object are never sent. Gemini as the PRIMARY model:
+      with GEMINI_ENABLED on, no ANTHROPIC_API_KEY and OpenRouter off, the
+      Settings validator ``_gemini_as_primary`` replaces the Claude
+      defaults of DEFAULT_MODEL / DEEP_REASONING_MODEL / ROUTING_MODEL /
+      RESEARCH_MODEL (only those not set explicitly) with the first
+      GEMINI_MODELS entry, so the whole application runs on Gemini out of
+      the box; with an Anthropic key alongside, Claude stays the default
+      and the operator points those settings at a Gemini id. The Fast
+      quality preset falls back to gemini-3.8-flash when no Haiku is
+      allowed. A bare Gemini id with GEMINI_ENABLED=false and OpenRouter
+      on routes through OpenRouter under its ``google/`` slug (the
+      OpenRouter resolver adds the prefix), with that catalog entry's
+      spec.
       Slugs listed in LOCAL_MODELS route to the local backend before any
-      other rule is consulted; remaining non-Claude slugs route through
+      other rule is consulted; then Gemini ids go to the Gemini API when it
+      is on; remaining non-Claude slugs route through
       OpenRouter; selecting an
-      OpenRouter-only slug with OPENROUTER_ENABLED=false is rejected at the
-      API layer.
+      OpenRouter-only slug (or a Gemini id with both Gemini and OpenRouter
+      off) with OPENROUTER_ENABLED=false is rejected at the
+      API layer with a 400 naming the flag to turn on.
       Provider selection is per-call by model, not global — so the
       Executive can be on GPT-6 while the CFO specialist stays on
       claude-opus-5 within the same turn.
@@ -99,7 +131,7 @@ system:
     - Audit writes never break a chat turn or tool call — exceptions are swallowed with a warning.
     - Provider selection is per-call by model (openexecutive.providers.get_provider(model)). A single chat turn can mix Anthropic-routed Claude calls, OpenRouter-routed non-Claude calls, and locally-routed self-hosted models — no global "current provider" state.
     - When a non-Claude or local model is selected, Anthropic-only fields (cache_control on system/tool/user blocks, adaptive thinking + output_config) are stripped by the feature gate before the request leaves the process. The web_search server tool is kept for every OpenRouter model (the translator swaps it for OpenRouter's `web` plugin, which serves any model) and stripped only for a self-hosted OpenAI-compatible backend, which has no search plugin. Callers do NOT need to know which model they're routing to.
-    - ANTHROPIC_API_KEY is optional: a Settings validator requires at least one provider (Anthropic key, OpenRouter, or local models) to be configured, so an Anthropic-free deployment is supported but a zero-provider one fails fast at startup.
+    - ANTHROPIC_API_KEY is optional: a Settings validator requires at least one provider (Anthropic key, Gemini, OpenRouter, or local models) to be configured, so an Anthropic-free deployment is supported but a zero-provider one fails fast at startup.
     - External-monitor adapters are read-only — they never write to upstream systems. The whole `monitoring/` subsystem is observation-only; surfacing happens through the alert pipeline, never via a direct upstream side-effect.
     - External signals never auto-execute on the principal's behalf. Every signal that surfaces is proposed via the alert pipeline (and thus subject to triage / mute / severity gates); the scheduler never dispatches an outbound message directly off a signal.
     - An external signal whose `dedup_key` already exists is dropped at ingest via the UNIQUE(dedup_key) constraint on `external_signals`. Adapter retries / re-polls cannot multiply alerts for the same upstream event.
@@ -417,7 +449,9 @@ caching:
     OpenRouter search's ``<cite>`` markup is stripped from tool-call
     arguments before they are parsed, so a citation inside an
     `emit_research_findings` string cannot empty the payload. Only the
-    self-hosted OpenAI-compatible backend strips the tool (no server tool
+    self-hosted OpenAI-compatible backend and the Gemini-direct backend
+    (GEMINI_ENABLED; Gemini's OpenAI layer has no server search tool)
+    strip the tool (no server tool
     there). The older ``plugins:[{"id":"web"}]`` plugin is deprecated by
     OpenRouter and no longer used.
 
@@ -453,7 +487,9 @@ providers:
     agent_overrides.use_deep_reasoning) adds Anthropic-native
     ``thinking={"type":"adaptive"}`` + ``output_config.effort``
     (SPECIALIST_EFFORT) to the call. It is honoured on: Claude Opus/Sonnet
-    via Anthropic direct; Claude via OpenRouter; and every non-Claude
+    via Anthropic direct; Claude via OpenRouter; every Gemini id on the
+    Gemini API directly (GEMINI_ENABLED — the fields become Gemini's
+    ``reasoning_effort``); and every non-Claude
     OpenRouter model the live catalog marks reasoning-capable (today: all
     OpenAI, Gemini, DeepSeek and Grok entries — not Llama). It is a silent
     no-op on models that can't reason (feature gate strips the fields).

@@ -30,7 +30,8 @@ PRESET_IDS: tuple[PresetId, ...] = ("fast", "balanced", "thorough")
 _STATUS_ORDER: tuple[PresetId, ...] = ("balanced", "fast", "thorough")
 
 # Preferred models, best first. The first one the install allows wins.
-_FAST_MODELS: tuple[str, ...] = ("claude-haiku-5-5", "claude-haiku-4-5")
+# Gemini Flash closes the list so Fast still exists on a Gemini-only install.
+_FAST_MODELS: tuple[str, ...] = ("claude-haiku-5-5", "claude-haiku-4-5", "gemini-3.8-flash")
 _THOROUGH_MODELS: tuple[str, ...] = ("claude-opus-5-5", "claude-opus-5")
 
 

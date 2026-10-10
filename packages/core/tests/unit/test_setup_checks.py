@@ -241,6 +241,13 @@ async def test_ai_model_without_anthropic_names_the_provider_in_use() -> None:
     assert "OpenRouter" in check.summary
 
 
+async def test_ai_model_without_anthropic_names_gemini() -> None:
+    settings = make_settings(ANTHROPIC_API_KEY=None, GEMINI_ENABLED=True, GEMINI_API_KEY="AIza-real")
+    check = await check_ai_model(make_snap(settings))
+    assert check.state == "ok"
+    assert "Gemini" in check.summary
+
+
 # ---------------------------------------------------------------------------
 # Company, owner, the Executive's address, API protection
 # ---------------------------------------------------------------------------

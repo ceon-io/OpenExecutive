@@ -207,3 +207,11 @@ def test_every_council_agent_has_a_visibility(client: TestClient) -> None:
     assert {"quality_judge", "utility_fast", "research"} <= {
         n for n, v in agents.items() if v == "internal"
     }
+
+
+def test_fast_preset_falls_back_to_gemini_flash_on_a_gemini_only_install() -> None:
+    gemini_only = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
+    assert preset_model("fast", gemini_only) == "gemini-3.8-flash"
+    assert preset_available("fast", gemini_only)
+    # Claude Haiku still wins when the install offers it.
+    assert preset_model("fast", ["gemini-3.8-flash", "claude-haiku-5-5"]) == "claude-haiku-5-5"
