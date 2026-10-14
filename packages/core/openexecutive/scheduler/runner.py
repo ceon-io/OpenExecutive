@@ -167,6 +167,19 @@ def _maybe_send_reminders(now: datetime) -> bool:
         return False
 
 
+def _maybe_release_held(now: datetime) -> bool:
+    """Send the messages held for quiet hours once they end, and the ones held
+    for a brief that went to someone without one (people/held_messages.py).
+    A hook like the reminders. Never raises."""
+    try:
+        from openexecutive.people.held_messages import maybe_release
+
+        return maybe_release(now)
+    except Exception:
+        logger.exception("scheduler: held-message release failed to start")
+        return False
+
+
 def _maybe_sweep_alerts(now: datetime) -> int:
     """Run the expiry sweep if the interval has elapsed. Returns rows expired.
 
@@ -329,6 +342,7 @@ async def run_scheduler(
             _maybe_scan_inbox(now)
             _maybe_remind_notes(now)
             _maybe_send_reminders(now)
+            _maybe_release_held(now)
             due = claim_due_actions(now)
             if due:
                 logger.info("scheduler: %d due action(s)", len(due))
@@ -351,6 +365,24 @@ async def run_scheduler(
         except asyncio.CancelledError:
             logger.info("scheduler cancelled — exiting")
             raise
+
+
+def _record_held_action(card_id: int | None, action_id: int) -> None:
+    """Bind the card the gate just filed to the action it holds, so
+    approving it (POST /alerts/{id}/approve) queues that exact action
+    again. None means the card folded into one already open, which keeps
+    its own binding. Best effort: without it the card still reaches its
+    approver, and approving it runs as a chat turn instead."""
+    if card_id is None:
+        return
+    from openexecutive.alerts.approvals import record_held_action
+
+    try:
+        record_held_action(card_id, action_id)
+    except Exception:
+        logger.exception(
+            "scheduler: couldn't bind card %d to held action %d", card_id, action_id,
+        )
 
 
 async def _execute_action(
@@ -461,13 +493,14 @@ async def _execute_action(
                         action.id, decision.deliver_at.isoformat(),
                     )
                     return
-                propose_via_alert(
+                card_id = propose_via_alert(
                     department_slug=action.department,
                     person_id=decision.assignee_person_id,
                     summary=action.intent_text[:160],
                     body=action.intent_text,
                     suggested_action=_proposed_action_phrase(urgent=False),
                 )
+                _record_held_action(card_id, action.id)
             mark_action_done(action.id)
             logger.info(
                 "scheduler: action %d proposed to person %s — not dispatched",
@@ -486,7 +519,7 @@ async def _execute_action(
             # is kept from being lost); if it cannot be written the row is
             # retried with backoff and finally marked failed — never done.
             try:
-                escalate_via_alert(
+                card_id = escalate_via_alert(
                     action.department,
                     decision.assignee_person_id,
                     summary=f"[ESCALATION] {action.intent_text[:140]}",
@@ -512,6 +545,7 @@ async def _execute_action(
                         action.id, action.department,
                     )
                 return
+            _record_held_action(card_id, action.id)
             if decision.assignee_person_id is None:
                 logger.warning(
                     "scheduler: escalate for dept=%r has no approver — "
@@ -539,7 +573,12 @@ async def _execute_action(
         # is recorded `cancelled` (reason in last_error), not `done`: a done
         # cadence row reads as "the check-in ran", which the nudge engine
         # takes as covering the department's idle initiatives.
-        skip_reason = _dept_check_in_skip_reason(slug, now)
+        # Run again from a failure card runs once, skip rule or not: someone
+        # asked for it.
+        from openexecutive.workflows.failure_alerts import is_rerun
+
+        rerun = is_rerun(action.scope_key)
+        skip_reason = None if rerun else _dept_check_in_skip_reason(slug, now)
         if skip_reason is not None:
             logger.info("scheduler: dept_cadence %r skipped — %s", slug, skip_reason)
             _chain_dept_cadence(slug)
@@ -623,6 +662,9 @@ async def _execute_action(
                     fail_run(run_id, str(exc))
                 except Exception:
                     pass
+                if new_status == "failed":
+                    # Nobody watches a scheduled run: say so on Home.
+                    _file_dept_check_in_failure(slug, run_id)
         return
 
     # ------------------------------------------------------------------
@@ -975,11 +1017,21 @@ async def _execute_action(
             next_available_window,
             prefer_channel_for,
         )
-        from openexecutive.scheduler.nudge_engine import _leave_end_for
+        from openexecutive.scheduler.nudge_engine import (
+            SCOPE_PREFIX_STALLED,
+            _leave_end_for,
+        )
 
-        pref = prefer_channel_for(action.assigned_to_person_id, now=now)
+        # The person's own quiet hours defer it too; an approval nudge is
+        # urgent (people.notifications).
+        urgent = (action.scope_key or "").startswith(SCOPE_PREFIX_STALLED)
+        pref = prefer_channel_for(
+            action.assigned_to_person_id, now=now, quiet_hours=True, urgent=urgent
+        )
         if pref is None:
-            nxt = next_available_window(action.assigned_to_person_id, after=now)
+            nxt = next_available_window(
+                action.assigned_to_person_id, after=now, quiet_hours=True, urgent=urgent
+            )
             leave_end = _leave_end_for(action.assigned_to_person_id)
             defer_to = nxt
             if leave_end is not None and (defer_to is None or defer_to <= leave_end):
@@ -1070,14 +1122,25 @@ async def _execute_action(
         logger.info("scheduler: action %d (__internal__) completed without dispatch", action.id)
         return
 
+    # The gateway the scheduler was started with is the one boot had, which
+    # is None when the first start failed; a retry may have brought one up
+    # since, and this is the moment to try once more if not
+    # (orchestrator.gateway_boot).
+    if gateway is None and action.channel == "email":
+        from openexecutive.orchestrator.mcp_gateway import ensure_active_gateway
+
+        gateway = await ensure_active_gateway()
+
     # Email channel requires MCP (the mail send tool is an MCP tool, whichever
     # backend EMAIL_PROVIDER names). Without a gateway, the Executive cannot
     # deliver — short-circuit with a clear error rather than burning attempts
     # on silent failures.
     if action.channel == "email" and gateway is None:
+        from openexecutive.orchestrator.mcp_gateway import gateway_problem
+
         mark_action_failed_or_retry(
             action.id,
-            "email channel requires MCP gateway, which is not configured",
+            f"email channel requires the MCP gateway: {gateway_problem()}",
         )
         logger.warning(
             "scheduler: action %d (email) cannot run without MCP gateway",
@@ -1085,6 +1148,7 @@ async def _execute_action(
         )
         return
 
+    held_ids: list[int] = []
     try:
         from openexecutive.knowledge.retriever import retrieve
         from openexecutive.memory.episodic import format_for_prompt
@@ -1143,9 +1207,10 @@ async def _execute_action(
 
         executive = Executive(mcp_gateway=gateway)
         from openexecutive.attunement.outcomes import tag_proactive
+        from openexecutive.people.held_messages import track_holds
 
         source, ref = _outreach_source(action)
-        with tag_proactive(source, ref):
+        with tag_proactive(source, ref), track_holds() as held_ids:
             await executive.chat(
                 user_message=synthetic_message,
                 session=session,
@@ -1177,16 +1242,21 @@ async def _execute_action(
     mark_action_done(action.id)
     logger.info("scheduler: action %d done", action.id)
     from openexecutive.audit import log_event as audit_log
+    # What it sent was held for the recipient's quiet hours or brief
+    # (people.held_messages): say so, not "delivered".
+    phase = "held" if held_ids else "delivered"
     audit_log(
         "scheduled_action",
-        f"Scheduled action {action.id} delivered via {action.channel} → {action.channel_ref}",
+        f"Scheduled action {action.id} {phase} via {action.channel} → {action.channel_ref}"
+        + (f" ({len(held_ids)} message(s) held for the recipient)" if held_ids else ""),
         session_id=action.originating_session_id,
         actor="scheduler",
         details={
-            "phase": "delivered",
+            "phase": phase,
             "action_id": action.id,
             "channel": action.channel,
             "channel_ref": action.channel_ref,
+            **({"held_count": len(held_ids)} if held_ids else {}),
         },
     )
 
@@ -1252,6 +1322,27 @@ def _chain_dept_cadence(slug: str) -> bool:
             "resumes at the next boot (bootstrap_cadences)", slug,
         )
         return False
+
+
+def _file_dept_check_in_failure(slug: str, run_id: str) -> None:
+    """The Home card for a check-in whose retries are spent. Never raises."""
+    from openexecutive.workflows.failure_alerts import file_failed_run_card
+
+    title = slug
+    try:
+        from openexecutive.departments import store as dept_store
+
+        state = dept_store.get_department(slug)
+        if state is not None and state.config.title:
+            title = state.config.title
+    except Exception:
+        logger.exception("scheduler: dept_cadence %r — title lookup failed", slug)
+    file_failed_run_card(
+        run_id=run_id,
+        workflow_name="department_check_in",
+        title=f"{title} check-in",
+        scope=slug,
+    )
 
 
 def _mark_check_in_skipped(action_id: int, reason: str) -> None:
@@ -1727,7 +1818,13 @@ def _delivered_ok(result_json: str) -> bool:
         parsed = _json.loads(result_json)
     except (ValueError, TypeError):
         return False
-    return isinstance(parsed, dict) and "error" not in parsed and parsed.get("status") == "sent"
+    # "held": stored for the recipient's quiet hours or brief
+    # (people.held_messages), so trying the next channel would hold it twice.
+    return (
+        isinstance(parsed, dict)
+        and "error" not in parsed
+        and parsed.get("status") in ("sent", "held")
+    )
 
 
 # `Person.preferred_channel` values (people/models.py PreferredChannel) mapped
@@ -1792,22 +1889,51 @@ def google_workspace_ready() -> bool:
     return "google_workspace" in configured_server_names(get_settings().mcp_servers_config_path)
 
 
-def email_ready() -> bool:
-    """Whether the Executive can send email: the MCP gateway is up and runs
-    the server of the configured mail backend (``EMAIL_PROVIDER``: the Google
-    Workspace server for Gmail, the Microsoft 365 one for Outlook)."""
+def mail_server_configured() -> bool:
+    """Whether the MCP config names the server of the configured mail backend
+    (``EMAIL_PROVIDER``: the Google Workspace server for Gmail, the Microsoft
+    365 one for Outlook) — email is set up, whether or not the gateway that
+    runs it is up right now."""
     from openexecutive.config import get_settings
     from openexecutive.integrations.workspace.registry import get_mail_provider
-    from openexecutive.orchestrator.mcp_gateway import (
-        configured_server_names,
-        get_active_gateway,
-    )
+    from openexecutive.orchestrator.mcp_gateway import configured_server_names
 
-    if get_active_gateway() is None:
-        return False
     settings = get_settings()
     server = get_mail_provider(settings).server_name
     return server in configured_server_names(settings.mcp_servers_config_path)
+
+
+def email_ready() -> bool:
+    """Whether the Executive can send email: the MCP gateway is up and runs
+    the server of the configured mail backend (``mail_server_configured``)."""
+    from openexecutive.orchestrator.mcp_gateway import get_active_gateway
+
+    return get_active_gateway() is not None and mail_server_configured()
+
+
+def mail_gateway_problem(person: Person | None, *, with_error: bool = True) -> str | None:
+    """Why email to ``person`` is blocked by the gateway, in a line, or None.
+
+    Only when email is the Executive's fault: ``person`` has an address and
+    the mail server is configured, but the gateway that sends is not
+    running. Nothing when email was never set up, or when it works.
+    """
+    from openexecutive.orchestrator.mcp_gateway import gateway_problem
+
+    if person is None or not getattr(person, "email", None) or not mail_server_configured():
+        return None
+    return gateway_problem(with_error=with_error)
+
+
+async def ensure_email_ready() -> bool:
+    """``email_ready``, after the lazy re-check: with the gateway down and
+    email otherwise set up, ask the supervisor for a start now rather than
+    sending nothing and waiting for the next scheduled retry."""
+    if mail_server_configured():
+        from openexecutive.orchestrator.mcp_gateway import ensure_active_gateway
+
+        await ensure_active_gateway()
+    return email_ready()
 
 
 def principal_delivery_plan() -> tuple[Person | None, list[str]]:
@@ -1836,22 +1962,25 @@ def _email_subject(label: str, now: datetime | None = None) -> str:
     return f"{label} — {local:%a} {local.day} {local:%b}"
 
 
-async def _email_principal(principal: Person, text: str, label: str) -> bool:
+async def _email_principal(principal: Person, text: str, label: str) -> str | None:
     """Send ``text`` (Markdown) to the principal's address through the active
     MCP gateway, formatted as HTML (``utils.markdown_email``).
 
     Sent as the Executive's own mailbox (the principal is on the roster, so
-    the gateway's egress gate allows it). False when there is no gateway or
-    the tool reports an error in-band.
+    the gateway's egress gate allows it). None on a clean send; otherwise
+    what went wrong in a line — no gateway, no address, or the error the
+    tool reported in-band — for the delivery record.
     """
     from openexecutive.integrations.workspace.registry import send_from_executive
-    from openexecutive.orchestrator.mcp_gateway import get_active_gateway
+    from openexecutive.orchestrator.mcp_gateway import gateway_problem, get_active_gateway
     from openexecutive.utils.markdown_email import markdown_to_email_html
     from openexecutive.workflows.action_step import looks_like_error
 
     gateway = get_active_gateway()
-    if gateway is None or not principal.email:
-        return False
+    if not principal.email:
+        return "no email address"
+    if gateway is None:
+        return gateway_problem() or "the MCP gateway is not running"
     result = await send_from_executive(
         gateway,
         to=principal.email,
@@ -1861,8 +1990,31 @@ async def _email_principal(principal: Person, text: str, label: str) -> bool:
     )
     if looks_like_error(result):
         logger.warning("scheduler: email to the principal failed: %s", result[:300])
-        return False
-    return True
+        return _error_line(result)
+    return None
+
+
+def _error_line(result: str) -> str:
+    """The error a tool handler reported, in a line: the ``error`` value of
+    its JSON, else the text itself, cut short."""
+    import json as _json
+
+    text = result
+    try:
+        parsed = _json.loads(result)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        error = parsed.get("error")
+        if error is not None:
+            text = error if isinstance(error, str) else _json.dumps(error)
+        elif parsed.get("status") != "sent":
+            text = f"status {parsed.get('status')!r}, not sent"
+    return " ".join(str(text).split())[:_FAILURE_LINE_MAX]
+
+
+# The longest per-channel failure kept in a delivery's detail.
+_FAILURE_LINE_MAX = 200
 
 
 @dataclass(frozen=True)
@@ -1886,9 +2038,12 @@ async def _deliver_to_principal(text: str, *, label: str = "Update") -> Principa
     action done (no point retrying the same misconfiguration) but audits the
     failure.
     """
-    principal, plan = principal_delivery_plan()
+    from openexecutive.people.store import find_principal_person
+
+    principal = find_principal_person()
     if principal is None:
         return PrincipalDelivery(False, "no principal Person row found", "no_owner")
+    plan = delivery_order(principal, email_ready=await ensure_email_ready())
     return await _send_on_plan(principal, plan, text, label=label)
 
 
@@ -1896,7 +2051,8 @@ async def deliver_to_person(person: Person, text: str, *, label: str = "Update")
     """Send ``text`` to ``person`` alone, the way the briefs reach the
     principal: their own Slack or Discord DM, their Telegram chat, or email
     to their own address (``delivery_order``, which skips a Telegram group)."""
-    return await _send_on_plan(person, delivery_order(person, email_ready=email_ready()), text, label=label)
+    plan = delivery_order(person, email_ready=await ensure_email_ready())
+    return await _send_on_plan(person, plan, text, label=label)
 
 
 async def _send_on_plan(
@@ -1905,10 +2061,17 @@ async def _send_on_plan(
     """Try ``plan``'s channels for ``principal`` (any Person) in order until
     one sends."""
     if not plan:
+        # Email set up but its gateway down is the Executive's fault, not a
+        # missing setting: say so, with the start failure, instead of
+        # "nothing is set up" (which told the owner to connect what they had).
+        blocked = mail_gateway_problem(principal)
+        if blocked is not None:
+            return PrincipalDelivery(False, f"email not available: {blocked}", "gateway_down")
         return PrincipalDelivery(
             False, "no deliverable channel configured for principal", "no_channel"
         )
 
+    failures: list[str] = []
     for channel in plan:
         try:
             if channel == "slack_dm" and principal.slack_user_id:
@@ -1918,6 +2081,7 @@ async def _send_on_plan(
                 })
                 if _delivered_ok(result):
                     return _sent(channel, principal.slack_user_id)
+                failures.append(f"{channel}: {_error_line(result)}")
             elif channel == "discord_dm" and principal.discord_user_id:
                 from openexecutive.orchestrator.schedule_tools import handle_send_discord_dm
                 result = await handle_send_discord_dm({
@@ -1925,6 +2089,7 @@ async def _send_on_plan(
                 })
                 if _delivered_ok(result):
                     return _sent(channel, principal.discord_user_id)
+                failures.append(f"{channel}: {_error_line(result)}")
             elif channel == "telegram" and principal.telegram_chat_id:
                 from openexecutive.orchestrator.schedule_tools import (
                     handle_send_telegram_message,
@@ -1934,13 +2099,20 @@ async def _send_on_plan(
                 })
                 if _delivered_ok(result):
                     return _sent(channel, principal.telegram_chat_id)
-            elif channel == "email" and await _email_principal(principal, text, label):
-                return _sent(channel, principal.email)
-        except Exception:
+                failures.append(f"{channel}: {_error_line(result)}")
+            elif channel == "email":
+                error = await _email_principal(principal, text, label)
+                if error is None:
+                    return _sent(channel, principal.email)
+                failures.append(f"email: {error}")
+            else:
+                failures.append(f"{channel}: no id to send to")
+        except Exception as exc:
             logger.exception("scheduler: delivery via %s failed", channel)
+            failures.append(f"{channel}: {_error_line(str(exc) or type(exc).__name__)}")
 
     return PrincipalDelivery(
-        False, f"delivery failed on every channel ({', '.join(plan)})", "send_failed"
+        False, "delivery failed on every channel: " + "; ".join(failures), "send_failed"
     )
 
 
@@ -1966,6 +2138,7 @@ async def _run_dynamic_workflow(action: ScheduledAction, now: datetime) -> None:
         schedule_dynamic_workflow_cadence,
     )
     from openexecutive.workflows.dynamic_store import get_definition
+    from openexecutive.workflows.failure_alerts import file_failed_run_card, is_rerun
     from openexecutive.workflows.gate import checkpoint_gate
     from openexecutive.workflows.persistence import complete_run, create_run, fail_run
     from openexecutive.workflows.wait_for_human import WaitForHumanEvent
@@ -2026,6 +2199,13 @@ async def _run_dynamic_workflow(action: ScheduledAction, now: datetime) -> None:
         logger.exception("scheduler: dynamic_workflow %r (action %d) failed", name, action.id)
         with contextlib.suppress(Exception):
             fail_run(run_id, str(exc))
+        file_failed_run_card(
+            run_id=run_id,
+            workflow_name=name,
+            title=defn.title or name,
+            scope=name,
+            routed_to_person_id=action.assigned_to_person_id,
+        )
     else:
         # Deliver AFTER the run is marked done, in its own guard — a delivery
         # failure (e.g. revoked token) must not regress a successfully
@@ -2046,7 +2226,9 @@ async def _run_dynamic_workflow(action: ScheduledAction, now: datetime) -> None:
                 )
 
     mark_action_done(action.id)
-    schedule_dynamic_workflow_cadence(defn, after=datetime.now(UTC))
+    # A Run again is a one-off: the cadence already has its next occurrence.
+    if not is_rerun(getattr(action, "scope_key", None)):
+        schedule_dynamic_workflow_cadence(defn, after=datetime.now(UTC))
 
 
 async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
@@ -2143,10 +2325,22 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
             recorded = True
         else:
             sending = True
-            delivery = await _deliver_to_principal(artifact, label=workflow.title)
+            # Messages the principal asked to get in their brief ride along
+            # as one "While you were away" block (people.held_messages).
+            delivered_text, held_ids = _with_held_messages(kind, artifact)
+            try:
+                delivery = await _deliver_to_principal(delivered_text, label=workflow.title)
+            except BaseException:
+                _unclaim_held(held_ids)
+                raise
             ok, detail = delivery.ok, delivery.detail
+            if ok:
+                await _mark_held_sent(held_ids)
+            else:
+                _unclaim_held(held_ids)
             brief_state.record_delivery_outcome(
-                kind, reason=delivery.reason, channel=delivery.channel
+                kind, reason=delivery.reason, channel=delivery.channel,
+                detail=None if ok else detail,
             )
             recorded = True
             if ok:
@@ -2179,8 +2373,14 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
             fail_run(run_id, str(exc))
         if not recorded:
             brief_state.record_delivery_outcome(
-                kind, reason="send_failed" if sending else "not_written", channel=None
+                kind, reason="send_failed" if sending else "not_written", channel=None,
+                detail=f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__,
             )
+
+    if kind in _DIGEST_BRIEF_KINDS:
+        # Everyone else who chose "In my briefs" gets theirs now, on its own:
+        # only the principal has a brief to carry them.
+        _release_others_digests(now)
 
     # Always chain the next occurrence + mark this row done, so a single
     # bad brief doesn't kill the recurring rhythm. Worst case the next
@@ -2191,6 +2391,65 @@ async def _run_principal_brief(action: ScheduledAction, now: datetime) -> None:
         logger.info("scheduler: %s not chained — the workspace is now in team mode", kind)
     else:
         _enqueue_next_principal_brief(kind, after=_chain_after(action))
+
+
+# The briefs that carry held messages ("In my briefs", people.notifications).
+_DIGEST_BRIEF_KINDS: frozenset[str] = frozenset({"principal_brief_morning", "principal_brief_eod"})
+
+
+def _with_held_messages(kind: str, artifact: str) -> tuple[str, list[int]]:
+    """``artifact`` with the principal's brief-held messages appended as one
+    "While you were away" block, and their ids — claimed, so a release pass
+    can't send them too; mark them sent once it went, else unclaim them.
+    The artifact unchanged when there are none or they can't be read."""
+    if kind not in _DIGEST_BRIEF_KINDS:
+        return artifact, []
+    try:
+        from openexecutive.people.held_messages import claim, for_brief, render_block
+        from openexecutive.people.notifications import get_notification_settings, zone_for
+        from openexecutive.people.store import find_principal_person
+
+        principal = find_principal_person()
+        if principal is None or principal.id is None:
+            return artifact, []
+        waiting = for_brief(principal.id)
+        got = set(claim([m.id for m in waiting]))
+        held = [m for m in waiting if m.id in got]
+        if not held:
+            return artifact, []
+        zone = zone_for(get_notification_settings(principal.id))
+        return f"{artifact.rstrip()}\n\n{render_block(held, zone=zone)}", [m.id for m in held]
+    except Exception:
+        logger.exception("scheduler: couldn't add held messages to the brief")
+        return artifact, []
+
+
+def _unclaim_held(ids: list[int]) -> None:
+    if not ids:
+        return
+    try:
+        from openexecutive.people.held_messages import unclaim
+
+        unclaim(ids)
+    except Exception:
+        logger.exception("scheduler: couldn't unclaim %d held message(s)", len(ids))
+
+
+async def _mark_held_sent(ids: list[int]) -> None:
+    from openexecutive.people.held_messages import mark_sent_after_delivery
+
+    await mark_sent_after_delivery(ids)
+
+
+def _release_others_digests(now: datetime) -> None:
+    try:
+        from openexecutive.people.held_messages import schedule_digest_release
+        from openexecutive.people.store import find_principal_person
+
+        principal = find_principal_person()
+        schedule_digest_release(now, except_person_id=principal.id if principal else None)
+    except Exception:
+        logger.exception("scheduler: couldn't release held messages with the briefs")
 
 
 def _outreach_source(action: ScheduledAction) -> tuple[str, str]:

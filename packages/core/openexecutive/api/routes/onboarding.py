@@ -34,6 +34,7 @@ from openexecutive.api.models import (
 )
 from openexecutive.config import get_settings
 from openexecutive.memory.company_profile import CompanyProfile
+from openexecutive.onboarding import interview_store
 from openexecutive.onboarding.interview import (
     MAX_QUESTIONS,
     MAX_TRANSCRIPT_CHARS,
@@ -281,6 +282,10 @@ async def get_onboard_status(session_id: str) -> OnboardStatusResponse:
 
 @dataclass
 class InterviewSession:
+    # Who started it (api_caller.identity_key): only they can read or carry
+    # it on. The id alone is not a capability now that sessions outlive the
+    # process and a browser remembers its id.
+    owner_key: str = ""
     transcript: list[Turn] = field(default_factory=list)
     questions_asked: int = 0
     draft: CompanyDraft | None = None
@@ -289,13 +294,15 @@ class InterviewSession:
     last_hint: str = ""
     saved: bool = False
     last_touched: float = field(default_factory=time.monotonic)
+    # Wall-clock time of the stored copy this one matches (interview_store).
+    stored_at: float = 0.0
 
 
-# In-memory, single-process — same assumption as _wizard_sessions above, but
-# with the TTL and cap that one is missing. Deliberately NOT persisted: the
-# transcript is unedited free text containing financials, and the artifact
-# worth keeping (the draft) is already in the client's hands. A page refresh
-# is covered by GET /onboard/interview/{id}.
+# The working table of this process, with a TTL and cap. Every turn is also
+# written through to SQLite (onboarding/interview_store.py), so a restart or
+# another worker finds the session again; a saved session's row is deleted
+# there at once, since the transcript carries the company's financials. A
+# page refresh is covered by GET /onboard/interview/{id}.
 _interview_sessions: OrderedDict[str, InterviewSession] = OrderedDict()
 _INTERVIEW_TTL_SECONDS = 2 * 3600
 _MAX_INTERVIEW_SESSIONS = 50
@@ -309,15 +316,39 @@ def _sweep_interview_sessions() -> None:
         if now - sess.last_touched > _INTERVIEW_TTL_SECONDS
     ]:
         _interview_sessions.pop(sid, None)
+        interview_store.delete(sid)
     while len(_interview_sessions) > _MAX_INTERVIEW_SESSIONS:
         _interview_sessions.popitem(last=False)
 
 
-def _get_interview(session_id: str) -> InterviewSession:
+def _persist_interview(session_id: str, session: InterviewSession) -> None:
+    interview_store.save(session_id, session)
+
+
+def _get_interview(session_id: str, request: Request) -> InterviewSession:
+    """The caller's session, or 404: unknown, expired, or someone else's.
+
+    The owner check comes before the session is touched or cached, so a
+    caller who guesses another person's id can neither keep it alive past
+    the TTL nor pull its transcript into this worker's table.
+    """
     _sweep_interview_sessions()
-    session = _interview_sessions.get(session_id)
+    held = _interview_sessions.get(session_id)
+    session = held
     if session is None:
+        # Not held here: started before a restart, or on another worker.
+        session = interview_store.load(session_id)
+    elif not session.saved:
+        # Held here, but another worker may have taken turns since: a newer
+        # stored row wins, so two processes never overwrite each other.
+        fresher = interview_store.load(session_id, newer_than=session.stored_at)
+        if fresher is not None:
+            session = fresher
+    if session is None or session.owner_key != api_caller.identity_key(request):
+        # Someone else's gets the same answer as an unknown id.
         raise HTTPException(status_code=404, detail="Setup session not found or expired.")
+    if session is not held:
+        _interview_sessions[session_id] = session
     session.last_touched = time.monotonic()
     _interview_sessions.move_to_end(session_id)
     return session
@@ -411,11 +442,13 @@ async def _advance_interview(
         session.transcript.append(Turn(role="assistant", text=result.question))
         session.questions_asked += 1
         session.last_hint = result.hint
+    _persist_interview(session_id, session)
     return _turn_response(session_id, session)
 
 
 @router.post("/onboard/interview/start", response_model=OnboardTurnResponse)
 async def start_interview(
+    request: Request,
     description: str = Form(""),
     files: list[UploadFile] = File(  # noqa: B008 — FastAPI multipart marker, mirrors chat.py
         default_factory=list
@@ -439,7 +472,7 @@ async def start_interview(
     extracted = await _gather_intake_attachments(files or [])
 
     session_id = str(uuid.uuid4())
-    session = InterviewSession()
+    session = InterviewSession(owner_key=api_caller.identity_key(request))
     _interview_sessions[session_id] = session
     # Sweep AFTER inserting: the cap is an invariant on what is stored, and
     # sweeping first would let the dict sit one over the cap until the next
@@ -453,6 +486,7 @@ async def start_interview(
     if not opening.strip():
         # Nothing to work with yet — ask the opening question without a model
         # call so an empty start is instant and free.
+        _persist_interview(session_id, session)
         return _turn_response(session_id, session)
 
     session.transcript.append(Turn(role="user", text=opening.strip()))
@@ -503,7 +537,7 @@ async def understand_description(
 
 
 @router.post("/onboard/interview/message", response_model=OnboardTurnResponse)
-async def interview_message(body: OnboardMessageRequest) -> OnboardTurnResponse:
+async def interview_message(body: OnboardMessageRequest, request: Request) -> OnboardTurnResponse:
     # Bounded here, not with Field(max_length=...) — FastAPI's 422 body echoes
     # the rejected input, and this message may carry financials.
     if len(body.message) > ONBOARD_MESSAGE_MAX_CHARS:
@@ -511,7 +545,7 @@ async def interview_message(body: OnboardMessageRequest) -> OnboardTurnResponse:
             status_code=422,
             detail=f"Message is too long (limit {ONBOARD_MESSAGE_MAX_CHARS:,} characters).",
         )
-    session = _get_interview(body.session_id)
+    session = _get_interview(body.session_id, request)
     if session.saved:
         raise HTTPException(status_code=409, detail="This setup session was already saved.")
     if not body.message.strip():
@@ -537,9 +571,9 @@ async def interview_message(body: OnboardMessageRequest) -> OnboardTurnResponse:
 
 
 @router.post("/onboard/interview/draft", response_model=OnboardTurnResponse)
-async def interview_draft(body: OnboardSessionRequest) -> OnboardTurnResponse:
+async def interview_draft(body: OnboardSessionRequest, request: Request) -> OnboardTurnResponse:
     """Force a draft now, however much is still unknown."""
-    session = _get_interview(body.session_id)
+    session = _get_interview(body.session_id, request)
     if session.saved:
         raise HTTPException(status_code=409, detail="This setup session was already saved.")
     if not session.transcript:
@@ -551,9 +585,9 @@ async def interview_draft(body: OnboardSessionRequest) -> OnboardTurnResponse:
 
 
 @router.get("/onboard/interview/{session_id}", response_model=OnboardSessionResponse)
-async def get_interview(session_id: str) -> OnboardSessionResponse:
+async def get_interview(session_id: str, request: Request) -> OnboardSessionResponse:
     """Resume after a page refresh: the transcript plus any existing draft."""
-    session = _get_interview(session_id)
+    session = _get_interview(session_id, request)
     base = _turn_response(session_id, session)
     return OnboardSessionResponse(
         **base.model_dump(),
@@ -574,6 +608,7 @@ async def commit_interview(body: OnboardCommitRequest, request: Request) -> Comp
     """
     from openexecutive.onboarding.commit import (
         OwnerEmailError,
+        adopt_owner_row,
         check_owner_email,
         derive_org_structure,
         link_owner_email,
@@ -584,7 +619,7 @@ async def commit_interview(body: OnboardCommitRequest, request: Request) -> Comp
     )
     from openexecutive.onboarding.interview import DepartmentDraft, PersonDraft
 
-    session = _get_interview(body.session_id)
+    session = _get_interview(body.session_id, request)
     if session.saved:
         raise HTTPException(
             status_code=409,
@@ -661,13 +696,15 @@ async def commit_interview(body: OnboardCommitRequest, request: Request) -> Comp
                 'owner as "This is me", or ask them to run setup.'
             ),
         )
+    caller_email = api_caller.caller_email(request)
     try:
-        owner_email = check_owner_email(body.owner_email, principal_name)
+        owner_email = check_owner_email(
+            body.owner_email, principal_name, caller_email=caller_email
+        )
     except OwnerEmailError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     # Someone who isn't the owner may fill in the owner's missing email only
     # with the address they signed in with (owner_email_blocked explains why).
-    caller_email = api_caller.caller_email(request)
     try:
         email_blocked = owner_email_blocked(owner_email, caller_person_id, caller_email)
     except (OSError, sqlite3.Error) as exc:
@@ -703,9 +740,15 @@ async def commit_interview(body: OnboardCommitRequest, request: Request) -> Comp
 
     # 4. Past this point the profile exists; nothing below may fail the request.
     session.saved = True
+    # The stored copy goes now: the transcript holds the financials, and the
+    # profile is on disk. This process still answers a repeat save with 409.
+    interview_store.delete(body.session_id)
 
     # 5-6. Best-effort seeding. Departments are reconciled additively — see
     #      onboarding/commit.py for why this must not mirror the fixture loader.
+    # The owner's seeded entry takes the drafted name first, so the upsert
+    # below updates it instead of adding a namesake (adopt_owner_row).
+    adopt_owner_row(owner_email, principal_name, caller_email)
     person_ids = save_onboarding_people(people)
     principal_id = person_ids.get(principal_name)
     if owner_email and principal_id is not None:

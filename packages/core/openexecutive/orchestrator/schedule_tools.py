@@ -27,6 +27,8 @@ from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from openexecutive.orchestrator.disclosure import with_chat_line
+
 logger = logging.getLogger(__name__)
 
 
@@ -185,7 +187,7 @@ def _guard_outbound(*, tool: str, channel: str, channel_ref: str, text: str) -> 
 
     reason = check_outbound_allowed(channel, channel_ref, text)
     if reason is None:
-        return None
+        return _hold_outbound(tool=tool, channel=channel, channel_ref=channel_ref, text=text)
     from openexecutive.audit import log_event as audit_log
 
     audit_log(
@@ -203,6 +205,58 @@ def _guard_outbound(*, tool: str, channel: str, channel_ref: str, text: str) -> 
         },
     )
     return json.dumps({"status": "suppressed", "reason": reason})
+
+
+def _hold_outbound(*, tool: str, channel: str, channel_ref: str, text: str) -> str | None:
+    """Hold the Executive's own outreach back when the recipient asked for
+    that (quiet hours, "In my briefs": ``outbound_guard.check_hold``).
+
+    Returns the ``{"status": "held"}`` result once the message is stored
+    (``people.held_messages``), or ``None`` to send it now — including when
+    it couldn't be stored, so a message is never lost to the hold."""
+    from openexecutive.orchestrator.outbound_guard import check_hold
+
+    held = check_hold(channel, channel_ref)
+    if held is None:
+        return None
+    person_id, source, hold = held
+    try:
+        from openexecutive.attunement.outcomes import current_tag
+        from openexecutive.people.held_messages import hold as store_held
+
+        tag = current_tag()
+        held_id = store_held(
+            person_id, text, source=source, release_at=hold.release_at,
+            ref=tag[1] if tag else "",
+        )
+    except Exception:
+        logger.exception("hold_outbound: couldn't store the message; sending it")
+        return None
+    from openexecutive.audit import log_event as audit_log
+
+    audit_log(
+        "tool_invocation",
+        f"{tool} HELD for person {person_id}: {hold.reason}",
+        actor="executive",
+        details={
+            "tool": tool,
+            "kind": "outbound",
+            "ok": True,
+            "held": True,
+            "held_id": held_id,
+            "person_id": person_id,
+            "source": source,
+            "channel": channel,
+            "release_at": hold.release_at.isoformat() if hold.release_at else None,
+        },
+    )
+    return json.dumps({
+        "status": "held",
+        "reason": (
+            f"Not sent now: {hold.reason}. It is saved and will be delivered "
+            "then — do not send it again or schedule it."
+        ),
+    })
 
 
 def _resolve_recipient_person_id(channel: str, channel_ref: str) -> int | None:
@@ -288,7 +342,7 @@ def _record_outbound_context(
         # Never for one of the principal's contacts. They cannot message the
         # bot, and hydrating their email reply with this backstory would quote
         # the principal's conversation into an unattended turn — whose opening
-        # the audit log (readable by everyone) records — and set that turn
+        # the audit log records — and set that turn
         # apart from any other outside sender's.
         from openexecutive.people.store import find_person_by_channel_ref
 
@@ -296,6 +350,15 @@ def _record_outbound_context(
             return
         originating_session_id = getattr(session, "session_id", None)
         recipient_person_id = _resolve_recipient_person_id(channel, channel_ref)
+        # A teammate's own conversation is theirs alone: their message to
+        # someone else is linked so the reply makes sense, but no excerpt of
+        # their chat goes with it into the recipient's turn
+        # (`inbound_hydration._build_backstory_excerpt`).
+        from openexecutive.orchestrator.people_tools import teammate_turn_owner
+
+        speaker = teammate_turn_owner(session)
+        if speaker is not None and speaker != recipient_person_id:
+            originating_session_id = None
         from openexecutive.memory.episodic import insert_outbound_context
 
         context_id = insert_outbound_context(
@@ -883,7 +946,9 @@ async def handle_send_telegram_message(tool_input: dict[str, Any]) -> str:
 
     from openexecutive.audit import log_event as audit_log
     try:
-        msg_id = await send_message(settings.telegram_bot_token, chat_id, text)
+        msg_id = await send_message(
+            settings.telegram_bot_token, chat_id, with_chat_line(text, f"telegram:{chat_id}")
+        )
     except Exception as exc:
         logger.exception("send_telegram_message: send failed")
         audit_log(
@@ -976,7 +1041,9 @@ async def handle_send_slack_dm(tool_input: dict[str, Any]) -> str:
     client = AsyncWebClient(token=settings.slack_bot_token)
     try:
         # No previews: Slack would fetch a link in the text to unfurl it.
-        result = await client.chat_postMessage(channel=user_id, text=text, unfurl_links=False, unfurl_media=False)
+        result = await client.chat_postMessage(
+            channel=user_id, text=with_chat_line(text, f"slack_dm:{user_id}"), unfurl_links=False, unfurl_media=False,
+        )
     except Exception as exc:
         logger.exception("send_slack_dm: send failed")
         return json.dumps({"error": f"send failed: {exc}"})
@@ -1119,7 +1186,7 @@ async def handle_send_discord_dm(tool_input: dict[str, Any]) -> str:
 
     from openexecutive.audit import log_event as audit_log
     try:
-        msg_id = await send_dm(discord_user_id, text)
+        msg_id = await send_dm(discord_user_id, with_chat_line(text, f"discord_dm:{discord_user_id}"))
     except Exception as exc:
         logger.exception("send_discord_dm: send failed")
         audit_log(
@@ -1467,7 +1534,9 @@ async def message_person(tool_input: dict[str, Any], *, alert_fallback: bool = T
             parsed = json.loads(result)
         except (ValueError, TypeError):
             parsed = {}
-        if parsed.get("status") == "sent":
+        if parsed.get("status") in ("sent", "held"):
+            # Held: saved for when they asked to hear (quiet hours, their
+            # brief) — trying the next channel would hold it twice.
             return result
         last_error = parsed.get("error") or last_error
 

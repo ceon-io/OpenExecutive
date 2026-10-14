@@ -86,6 +86,8 @@ system:
     - The Executive never signs messages under the name of company personnel or impersonates them. An identity addendum in system block 0 instructs the model to use its own exec name/email only. The single exception is Act as me (delegation) — with the person's own switch on and on their own verified turn in a conversation private to them, `ghostwrite_email` writes an email in their voice as a DRAFT in their own Gmail, never sent from chat (only that exact draft, when they tap Send on its reply card), never from the Executive's own account or bots, and never for anyone who has not turned it on (the principal, and team members once the owner lets them). The identity addendum itself is unchanged; the constant DELEGATION_ADDENDUM after it names the exception.
     - Voice follows the account. Text written as a person leaves only from that person's own Gmail (always as a draft first, sent only when they send it in Gmail or tap Send on its card); the Executive's own mailbox and bots always sign as the Executive.
     - The model cannot reach a delegated mailbox. delegation.gmail.DelegateGmail talks to the Gmail REST API directly and is never registered with the MCP gateway, so only typed handlers (ghostwrite_email, the voice learner) call it, and its credential never lives in WORKSPACE_MCP_CREDENTIALS_DIR. Every google_workspace__* call through the gateway acts as the Executive's own account (mcp_gateway._check_acting_account refuses any other user_google_email).
+    - A teammate's own mail with the Executive is private to them. Every mailbox call the model makes through the MCP gateway (call_tool, a script's calls, a workflow step run from chat) passes through orchestrator.teammate_mail.guard_call_tool. Searches exclude every other teammate's address (Gmail query -from/-to/-cc, headers forced on; Outlook lists always select the parties) and are filtered entry by entry; any other call naming a message or thread must use an id a filtered search returned to the same reader in this conversation (Session.mail_ids_seen, keyed by reader) or the inbound email the turn answers (email_poller seeds it); an Outlook call acting on a message (forward, reply, attachment) first reads its parties and is refused when it is another teammate's; a conversation where a non-principal teammate was shown their own mail is marked mail-private (session_store.mark_mail_private); Gmail thread/batch/search/attachment results are redacted in the audit log; reads are filtered message by message (a message naming another teammate is left out unless the reader is in its From / To / Cc); a Gmail reply with quote_original into a thread holding such a message is refused; Outlook search tools are refused. The reader is the principal or a teammate on a verified surface, or the teammate whose own email the turn answers when Gmail authenticated its From (Session.email_sender_authenticated); anyone else sees no teammate's mail. A background run the model drives (schedule_followup, reflection) reads as the principal; a workflow step outside any session reads as nobody (filters on, id gate off). Outlook mail rules / mailbox settings that forward or name another teammate are refused. The first turn that shows a non-principal teammate their own mail also marks that turn's remaining audit rows (its answer included) private to them. Internal callers (poller, brief) are unaffected. Fails closed when the roster can't be read.
+    - A teammate's own conversations with the Executive are private to them too. Every audit row of a turn a non-principal team member speaks on a verified surface, or by email Gmail authenticated as theirs, carries private_to_person (people_tools.teammate_turn_owner via audit_row_owner; the pre-bind rows via rows_for_person in audit_rows_on_senders_turn, the web chat route and the email poller). An unproven sender keeps the ordinary rule so a forged From can't hide a turn from the principal. The /audit read routes give the principal every row, a team member's own (their turns, Act as me, history notes) as an action only (api.routes.audit._redact: rebuilt summary naming the tool and whose conversation, safe details only, no full payload, left out of text search), and anyone else (once a principal exists) only their own rows in full (api.routes.audit._view, AuditLogger only_owned / all_owners); /audit/usage is unchanged. A teammate's web chat or DM (not a channel or group session, chat._shared_space) opens for its owner alone, the principal included (chat._session_access). A message the Executive sends to someone else on a teammate's turn is linked without its originating session, so the recipient's reply is not hydrated with an excerpt of the teammate's chat (schedule_tools._record_outbound_context).
     - The Executive never offers to loop in, DM, or notify the human it is currently talking to. Each chat turn carries a <current_speaker> hint in the user turn (resolved from the caller's person_id, principal-flagged) and the persona "Choosing Who to Tell" rule forbids routing to anyone already in the room — so the principal reading a brief is never told the Executive will "loop Jordan in."
     - Specialists run in parallel via route_parallel() for cross-domain questions.
     - The untrusted-content policy (orchestrator.content_trust) is the one rule for text the principal did not write — inbound email, chat, attached files, watched pages. WHO SPEAKS - the principal only when the surface proved it (principal_speaking - web chat as the principal, CLI, their own Slack/Discord or secret-verified Telegram, their own address with Gmail dmarc=pass); an empty origin_channel is never read as trust. MEMORY - episodic extraction only then, and only on words outside <untrusted_content> blocks; peer memory and open loops are recorded under the speaker's own name, never as the principal's. TOOLS - writes on the principal's authority refuse others in their handlers; PRINCIPAL_ONLY_TOOLS (load_mcp_server - it connects the install to any URL; list_saved_tools and run_python_job - the principal's own automations and library files; run_script - it runs code the model just wrote, spending the turn's whole call budget) are not offered unless the principal is speaking on an interactive surface (email excluded, even authenticated), and a call emitted anyway is refused with a not_principal audit row. LABEL - outside text sits in the user turn inside <untrusted_content source author author_verified> with a fixed no-authority notice; NFKC folds compatibility forms, control characters are dropped and the tag's name is renamed wherever the text carries it (any case, spacing, entity-escaped), so the text cannot close its block. The principal's authenticated mail is theirs, but what it quotes or forwards still goes in a block (source email_quoted). A new inbound surface is an entry in this module, not a gate invented at its call site.
@@ -174,7 +176,13 @@ caching:
         guard) + Connected Systems section (prompts/connected_systems.py:
         Google Workspace on/off from the running gateway's server_names, and
         when on the own-account guidance plus the pinned GOOGLE_TOOL_MANIFEST
-        names to call directly; other MCP servers by name; Slack / Discord /
+        names to call directly — or "needs reconnecting", with no tool
+        names, while google_workspace is in MCPGateway.needs_reconnect (set
+        by _note_grant_health when a tool answers with an authorization
+        failure, mcp_gateway.grant_failure; cleared by the next answer that
+        is not one, or mark_reconnected), passed as needs_reconnect=
+        gateway_reconnect_needed(gateway) so the set changing re-renders
+        block 0 once; other MCP servers by name; Slack / Discord /
         Telegram / Google Chat on/off; Notion sync; a constant Act as me line
         pointing at DELEGATION_ADDENDUM — all process-stable and sorted) +
         DELEGATION_ADDENDUM (Act as me — a constant, only while
@@ -870,11 +878,16 @@ routing:
     unrouted low/medium watchlist signals (`briefing.ranking.categorize`
     decides), computed from `created_at` at read/sweep time (no stored
     expiry, so a setting change applies to existing rows; 0 = never).
-    The age anchor is the later of `created_at` and `last_seen_at`, so a
-    situation that keeps re-firing (coalescing) stays live.
-    `list_live_alerts` = unread ∧ inside TTL ∧ `snoozed_until` null/past
-    (`snoozed_until` is a column only — nothing writes it yet; snooze UI is
-    a follow-up); `is_live(alert, now)` is the same predicate for one row;
+    The age anchor is the latest of `created_at`, `last_seen_at` and
+    `snoozed_until`, so a situation that keeps re-firing (coalescing) stays
+    live and a card snoozed past its TTL comes back instead of expiring.
+    `list_live_alerts` = unread ∧ inside TTL ∧ `snoozed_until` null/past.
+    Snooze is written by `POST /alerts/{id}/snooze` (`until` up to 30 days
+    ahead, or null to clear; `unread` rows only, never a roster request;
+    audited `alert_snoozed` / `alert_unsnoozed`) via
+    `store.set_snoozed_until`, from a card's ⋯ on Home (later today,
+    tomorrow 9:00, Monday 9:00 in the viewer's clock, with an Undo).
+    `is_live(alert, now)` is the same predicate for one row;
     `/today`, `briefing.context`, the briefs and the reflection all read it.
     `expire_stale_alerts` (called by the scheduler loop every 15 min and once
     at boot, `runner._maybe_sweep_alerts`) flips past-TTL rows to `expired`
@@ -1323,6 +1336,33 @@ routing:
     the names from the handler map ("unknown tool — skipped"). The alert
     triage backstop matches: alerts.preferences.resolve_channels strips
     department_channel and company_broadcast in solo.
+  ai_disclosure_invariant: |
+    What the Executive sends to people says it is an AI assistant, added by
+    plain code, never the prompt (orchestrator.disclosure). Mail from its
+    own mailbox: the MCP gateway appends the mail line to every Gmail send
+    or draft and every Outlook send, reply, forward or draft
+    (mcp_gateway._with_disclosure) after every outbound gate passed and only
+    on the arguments sent to the server, so gates, outbound-context records
+    and audit rows see the model's words. Skipped when every recipient is
+    the principal, when the body already has it, and for send_draft_message
+    (the draft got it when made). Only a last shown line counts as already
+    there. HTML that could hide what follows (disclosure.hides_what_follows)
+    is refused; the roster acknowledgement to a new sender gets
+    BARE_MAIL_LINE, which names nobody. Chat: the shorter line on the Executive's
+    Slack / Telegram / Discord / Google Chat replies and on send_slack_dm,
+    send_discord_dm, send_telegram_message and broadcast_tools._dispatch,
+    once per conversation per 24 hours (in memory; a restart shows it
+    again), applied at the send call only so the anti-spam guard and session
+    history see the text without it. AI_DISCLOSURE (default on) turns it
+    off; AI_DISCLOSURE_MAIL_TEXT / AI_DISCLOSURE_CHAT_TEXT reword it and are
+    ignored unless they say "AI". Fails open. Sends as a person (Act as me)
+    carry delegation.disclosure.LINE by that person's own switches
+    (delegation_disclosure: handle_it default AI_DISCLOSURE_HANDLE_IT=true,
+    approved_sends default AI_DISCLOSURE_APPROVED_SENDS=false), written into
+    the reply when it is drafted (inbox._consider, follow_ups) so card,
+    draft and sent mail match. PUT /delegation/disclosure changes them;
+    turning one off needs a signed caller. tests/conftest.py sets
+    AI_DISCLOSURE=false for the suite; test_ai_disclosure.py turns it on.
   outbound_antispam_invariant: |
     Every Per-Person DM (`send_slack_dm` / `send_discord_dm` /
     `send_telegram_message`) passes through a deterministic anti-spam guard
@@ -1360,6 +1400,11 @@ routing:
     and the `max_pending_*` caps on `schedule_followup`. Principal briefs and
     the internal heartbeat kinds (`__internal__` channel) never reach these
     handlers, so they are unaffected (see the `scheduler:` kinds note).
+    After the guard allows a send, the handlers apply the recipient's own
+    notification settings to the Executive's own (tagged) outreach:
+    `_hold_outbound` → `outbound_guard.check_hold` stores the DM in
+    `held_messages` and returns {"status":"held"} when they are in quiet
+    hours or chose "In my briefs" (people.notification_settings).
   reflection_then_decide: |
     Shift 5 introduces a new routing pattern: ``executive_reflection``
     is the first workflow that lets OE consume structured signal data
@@ -1778,15 +1823,27 @@ knowledge:
         newest first, capped at DRIVE_MAX_FILES_PER_SCAN; the overflow waits
         for the next tick.
         - Text: Docs / Slides are exported as text/plain and Sheets as .xlsx
-          (Drive's CSV export holds only the first sheet). PDF / .docx /
-          .xlsx / txt / md / csv are downloaded and read with
-          loader.extract_text_from_file, with no model call, so a scanned PDF
-          yields nothing. Anything else, and anything over 20 MB, is skipped.
-          Downloads stream and stop at the cap. A .docx / .xlsx whose zip
-          declares more than 100 MB uncompressed is not parsed. Extraction
-          has a 120 s deadline (the worker thread cannot be killed, but the
-          tick moves on). An unreadable file is recorded with no chunks, so
-          it is not refetched until it changes.
+          (Drive's CSV export holds only the first sheet). .docx / .xlsx /
+          txt / md / csv are downloaded and read with
+          loader.extract_text_from_file. A PDF goes through
+          pdf_reader.read_pdf_text, the path uploads take (not inbound, so
+          PDF_VISION_MAX_PAGES, not the inbound budget): the text layer, else
+          the opt-in model step (PDF_PROVIDER_READING), else local OCR in a
+          child process under the two-slot OCR gate, with PDF_OCR_ENABLED
+          switching it off for Drive as for uploads. Why: a scanned contract
+          in a shared folder used to be skipped silently. Anything else, and
+          anything over 20 MB, is skipped. Downloads stream and stop at the
+          cap. A .docx / .xlsx whose zip declares more than 100 MB
+          uncompressed is not parsed. Non-PDF extraction has a 120 s deadline
+          (the worker thread cannot be killed, but the tick moves on); a PDF
+          read keeps pdf_reader's own child limits, under a backstop
+          (_PDF_READ_TIMEOUT_S, 1200 s: text layer + a model allowance + OCR
+          slot wait, budget and slack). Busy parsers / OCR slots are a retry
+          next tick, not a verdict. An unreadable file is recorded with no
+          chunks and its reason (`unreadable` in the state record, e.g. the
+          reader's "it looks scanned and local OCR is turned off"), logged,
+          and shown on the knowledge page through `unreadable_reason` in
+          `GET /documents/drive`; it is not refetched until it changes.
         - A file with no text is recorded with no chunks, so it is not
           refetched until it changes.
         - Text is written under <company_profile_dir>/docs/drive/
@@ -1844,7 +1901,8 @@ knowledge:
         .xls / .rtf / .odt / .odp / .ods are fetched as Graph's PDF rendering
         (`?format=pdf`) and read as PDF. The extractor, size caps, depth 4,
         2000-item cap, 120 s deadline and request pause are imported from
-        drive_sync, so the two stay in step. Text is written under
+        drive_sync, so the two stay in step. Unlike Drive, a PDF here is read
+        by that extractor (text layer only), so a scanned PDF yields nothing. Text is written under
         <company_profile_dir>/docs/onedrive/ (onedrive-<id>-<slug>.md, with
         an onedrive_key comment). Reconcile, skip rules, locking and resets
         (fixture load/reset, client-slot switch) are Drive's. A refused
@@ -2693,6 +2751,16 @@ memory:
       never a teammate's notes. A run that used any is private_to_principal
       (the run history keeps PRIVATE_RUN_ARTIFACT) and the note ids with
       their state enter the fingerprint.
+    - The first week (briefing.first_week, seven days from the principal's
+      People row) gives the briefs a GETTING STARTED block so a new install
+      is never "quiet": onboarding goals, departments with no
+      head_person_id and, only on PRINCIPAL_DELIVERY with Act as me and Draft replies to my inbox on (the watcher's consent) and gmail_status connected, up
+      to five people who wrote to the owner's own mailbox in 48 hours as
+      sender and subject (no message text, bulk mail skipped). Counts
+      against the quiet check, its keys enter the fingerprint, the inbox
+      part marks the run private. The /today header gets the shared part
+      only (getting_started_shared, no mailbox read); GET /today sets
+      first_week so the UI drops the "Quiet day" banner.
     - Due-today reminders (memory.history_reminders, from the scheduler
       tick, 09:00 to 18:00 local) cover only promises made by email
       (approved_reply): chat promises are already open loops the nudge
@@ -3020,6 +3088,10 @@ peer_memory:
         attributed, once the principal adds them; non-roster email is
         triaged unattributed (see `integrations.channel_access`,
         `people.roster_requests`).
+        A matched chat-app sender reaches alert triage under that
+        Person's ``full_name``, never the chat app's self-chosen display
+        name, and the principal's own chat messages are not triaged
+        (``alerts.pipeline.schedule_chat_message_evaluation``).
       - Web ``/chat`` uses ``x-caller-email`` stamped by the Next.js
         proxy from the verified NextAuth session →
         ``find_person_by_email`` (primary address only — an alias never
@@ -3577,13 +3649,124 @@ departments:
     holding that scope ahead of WILDCARD-holders, so proposals can route
     to a domain owner instead of always falling back to the principal.
     A null/unknown `required_scope` falls back to WILDCARD (principal).
+    As the scheduler files a propose or escalate card it records which row
+    the card holds in `alert_held_actions` (`alerts.approvals.record_held_action`).
+    Approving one (`POST /alerts/{id}/approve`) queues a copy of that exact
+    row with no department, so the approval is the consent the gate waited
+    for and nothing re-reads the card's prose to decide what to send. The
+    binding is a server-side table on purpose: a first cut used a
+    `scheduled_action:<id>` topic tag, but tags, body and source can all be
+    written by a model (triage reading inbound mail, the Executive's
+    create_alert), and the review forwards an alert's tags onto a new gate
+    card, so a forged tag could re-send a held or already-sent action.
+    CHAT TURNS (orchestrator.department_gate): a team member's attended turn
+    (caller is a team member, not the principal; not unattended, not private
+    to the principal; or a web caller signed in but on no People entry, such
+    as an archived teammate still let in, or a chat-channel turn (any
+    origin_channel but email) whose sender matched no one, gated as someone
+    in no department. Slack, Telegram and Discord reject unmatched senders
+    before the turn, so in practice that is Google Chat. Google Chat matches
+    its sender by the Google account email on its signed event and sets
+    Session.gate_sender_person_id, read only by the gate (never
+    caller_person_id, since Google Chat is not a verified speaker surface),
+    so the principal there is not held and a teammate gets their own
+    department's authority. Email is left out: inbound senders are never
+    on People and the mailbox has its own recipient gates)
+    wraps its sends and edits with the gate, in
+    Executive._stream_agent_loop beside Take the lead's `leading` wrap:
+    `turn_handlers` for GATED_TOOLS (take_the_lead.ACTING_TOOLS less
+    assign_open_loop, which refuses any session but the asker's so a held one
+    could never run, and run_workflow, whose action steps are approved step
+    by step; under escalate those two are refused outright, since both lead
+    to sends later and neither can wait on a card), and `call_tool` (chat and run_script) for every name
+    `mcp_tool_acts` flags. The gate wrap sits inside guard_call_tool, so the
+    gateway's recipient and mailbox gates still run first. Level = strictest
+    of the speaker's department_slugs (escalate > propose_only >
+    auto_execute; unknown slug = propose_only; none = propose_only, routed
+    via _route_proposal). auto_execute runs; propose_only runs only when the
+    speaker holds a range from EVERY group of approval ranges it needs (one
+    group per kind the text touches: money, contract, people decision, board;
+    or WILDCARD), since they would be the approver anyway. Every group, not
+    the first: Take the lead's single-kind read let a $12 mention make a
+    petty-cash holder the approver of a termination letter; escalate always holds, and an
+    approver equal to the speaker is replaced by the next one
+    (find_approvers, else the principal). An action reaching anyone outside
+    the team goes to the principal (only their approval opens contact
+    egress). A message only to the principal runs (nothing to approve). Held
+    = decision class `department_action` (idempotency key per speaker+call,
+    same live card on a repeat), alert source decision_scheduling routed to
+    the approver, private tag when the approver is the principal (else the
+    card shows the unquoted line), audit department_action_held (actor
+    person:<speaker>, private to the principal or to the approver alone).
+    The payload keeps `details`, every field of the call in full, and the
+    UI's HeldActionCard loads it (GET /decisions/{id}) and keeps Approve off
+    until it is on screen: the summary keeps only the first 117 characters,
+    so an injected tail would otherwise be approved unseen. Approve (api.routes.decisions,
+    principal_and_approver) runs take_the_lead.carry_out once after
+    claim_for_execution and audits department_action_done/_failed;
+    reject audits department_action_declined. The activity rail skips the
+    class, since its payload quotes the conversation. Fails closed: a gate
+    error holds. Why: gate_action used to run only for unattended work and
+    propose_meeting, so a seat's Slack DM or Gmail send from chat skipped
+    propose_only and escalate.
+  card_approvals: |
+    openexecutive.alerts.approvals + POST /alerts/{id}/approve. Approve on
+    a Today card is carried out on the server for every card. A
+    decision-backed card goes through /decisions as before. Every other
+    proposal (the alert review's, a department gate's) is approved here:
+    `approvals.claim` checks and flips the card to `ack` and inserts an
+    `alert_approvals` row (alert_id, approved_by_person_id, approved_at,
+    edited_body, status running|done|failed, outcome, session_id,
+    finished_at) inside one BEGIN IMMEDIATE transaction, so a double click
+    or two approvers never run it twice (409). A card whose last approval
+    failed can be claimed again (Try again); one still running at a restart
+    is marked failed on boot (`fail_stale_running`, api/main.py lifespan).
+    Audit rows: alert_approved (actor person:<id>), then
+    alert_approval_done or alert_approval_failed, private when the card is.
+    Work: a card bound to a held scheduled action re-queues that action (see
+    authority_gate); anything else runs one Executive turn as the approver
+    through `chat.start_background_turn` (the code behind POST
+    /chat/background), so the turn is that person's, under their own access,
+    and keeps going after the tab closes; its session_id is on the row and
+    the drain reports whether the stream ended on an error frame. The
+    instruction text moved from Briefing.tsx to
+    `api.routes.alerts.APPROVED_PROPOSAL_PROMPT` /
+    `APPROVED_WITH_EDITS_PROMPT`, with the same memory line the briefing's
+    other handoffs use; the card's text goes in a <proposal> block marked
+    as data, since it can quote inbound mail and the turn now runs with no
+    one watching. Who may approve: a routed card only its person or the
+    principal; an unrouted card only the principal (Today's "principal owns
+    unrouted" rule). GET /alerts/approvals/{id} answers only the approver,
+    the card's person and the principal, since the row quotes an edited
+    message. A failed row says the turn may have done part of the work, so
+    the person checks its chat before Try again. Why: the page used to ack the card and
+    paste the proposal into a new chat turn. Nothing recorded who approved
+    it, and if the tab closed before the turn ran the card was gone and
+    nothing was done.
   cadence: |
     openexecutive.departments.cadence — supports `daily@HH:MM`,
     `weekly@DOW@HH:MM` or `weekly@DOW-HH:MM` (DOW is a 3-letter day,
     e.g. `weekly@thu@09:00`), and `quarterly@DD-HH:MM`. Times are UTC.
     `PATCH /departments/{slug}` rejects a spec that does not parse (bad
     format, unknown DOW, out-of-range time) with a 422 naming the valid
-    formats (`is_valid_cadence_spec`); an empty spec means no cadence.
+    formats (`is_valid_cadence_spec`); an empty spec means no cadence
+    (the department page's Off). A new department starts with
+    `weekly@mon@09:00` (charters.DEFAULT_CHECK_IN_CADENCE, used by
+    store.create_department and the catalogue seed). It was `daily@09:00`;
+    departments created before the change keep their cadence (no
+    migration). Why weekly: most goals do not move in a day, and a daily
+    check-in meant a check-in card per department every morning. A changed
+    `check_in` on PATCH re-times the department at once
+    (`reschedule_check_in`: cancel its pending dept_cadence rows, then
+    `enqueue_next`, which queues nothing for an empty spec or in solo), so
+    switching it off does not leave one more check-in on the old schedule.
+    A running check-in is left alone; its chain adds nothing because the
+    new row is pending (or, when off, `enqueue_next` returns None).
+    `GET`/`PATCH /departments/{slug}` return `DepartmentDetail` — the
+    state plus `next_check_in_at` (`next_check_in_at()`: the earliest
+    pending dept_cadence run_at, or null). The page's picker is Daily /
+    Weekly (day + time) / Off over that spec (UI lib/checkInCadence.ts);
+    a spec it cannot show (quarterly) is kept as-is until one is picked.
     `_parse_cadence_spec(spec, after, tz=UTC)` also takes a zone: it builds
     the wall-clock time in that zone and only then converts to UTC, so a
     local schedule is DST-safe (a time the spring-forward gap skips fires
@@ -3625,7 +3808,7 @@ departments:
     backoff (`mark_action_failed_or_retry`); once it returns `failed` the
     runner chains the next occurrence anyway (unless this attempt already
     chained before failing), so one broken department does not drop out
-    of the daily cycle. Chaining is idempotent (`runner._chain_dept_cadence`
+    of its cycle. Chaining is idempotent (`runner._chain_dept_cadence`
     adds nothing while a `pending` dept_cadence row for the department
     exists), so a row that chained and then failed to record its outcome
     — left `running`, requeued by the boot sweep — never duplicates the
@@ -3649,7 +3832,7 @@ departments:
     create_department unless a mission is given), and setup and create_goal
     wire it to the matching specialist (store.specialist_key_for_area, at
     most one department per specialist). Why: eight empty departments meant
-    eight daily check-ins in Coming up, eight empty cards and "no head"
+    eight check-ins in Coming up, eight empty cards and "no head"
     warnings for companies that never had those functions. Workspaces
     created before this keep what they have; nothing is removed.
     store.seed_default_departments still inserts the full catalogue once
@@ -4193,6 +4376,76 @@ people:
     `prefer_channel_for()` also enforces availability windows (returns
     None if the person is on leave or outside all configured windows;
     no windows means always-on).
+  notification_settings: |
+    Each team member sets their own on Settings → Notifications
+    (GET/PUT /notifications/settings, api.routes.notifications; caller
+    resolved like the notes routes: a signed-in person on the People list,
+    or the principal under local login, else 403). One row per person in
+    `person_notification_settings` (people.notifications): quiet hours
+    (enabled, start/end HH:MM in their zone, may cross midnight, start !=
+    end; days every_day or weekdays — weekdays keeps the nightly window and
+    makes Saturday and Sunday quiet all day), delivery instant | digest
+    ("As they happen" / "In my briefs"), urgent_through (default true), and
+    an IANA timezone ("" = the workspace zone). No row = defaults = nothing
+    held, so existing installs behave as before.
+    Scope: only the Executive's OWN outreach — a DM sent while a proactive
+    source is tagged (attunement.outcomes.tag_proactive: scheduler dispatch
+    of nudges, reflection, research, alert review). A reply
+    in a conversation, a send someone asked for in chat, a scheduled
+    follow-up (source followup, asked for at a time), the briefs, the
+    cross-client digest, workflow artifacts and Act as me / note reminders
+    are untagged and never held. Why not fold quiet hours into
+    is_within_availability for everyone: the outbound guard's availability
+    check runs on every DM, briefs included, and would refuse the brief the
+    person scheduled inside their own quiet hours.
+    Two mechanisms: (1) nudge routing — people.channel's
+    is_within_availability / is_reachable_now / next_window_for /
+    prefer_channel_for / next_available_window take `quiet_hours=True,
+    urgent=` and then also treat quiet hours as unavailable; the nudge
+    engine's _route_candidate and the runner's proactive_nudge re-check pass
+    it, so a nudge row is deferred to the end of quiet hours (no model run
+    at 3am, fresh text); (2) the send handlers' `_hold_outbound` after the
+    anti-spam guard allows a send: outbound_guard.check_hold → if the
+    recipient is in quiet hours or chose digest, the text is stored in
+    `held_messages` (people.held_messages) and the tool returns
+    {"status":"held"}; message_person returns it instead of trying the next
+    channel (which would hold it twice), alert review counts it as a move
+    made for a route but does not count a nudge toward the cap (and no
+    second nudge is held while one about that alert waits, by `ref`). A
+    store failure sends instead (fail-open, never lost). A scheduler
+    dispatch whose turn held its message is audited phase `held`, not
+    `delivered` (held_messages.track_holds).
+    Release: rows with release_at (quiet hours) go once due, per person as
+    one "While you were away" message via scheduler.runner.deliver_to_person
+    (scheduler tick hook _maybe_release_held, once a minute). Every sender
+    claims rows first (claimed_at compare-and-set, stale after 10 min), so a
+    release pass and a brief never both send one; marked sent only after
+    delivery, else the claim is freed. Postponed if quiet again, or to the
+    leave end / next availability window when the guard would refuse them;
+    any other failed delivery backs off 2, 4, 8 … min, capped at an hour.
+    Dropped after 7 days or when the person is archived, and the oldest past
+    the cap — each drop audited `held_messages_dropped`, private to the
+    person, a count and reason only. Digest rows (release_at null) ride the
+    principal's next morning brief / EoD digest as one block appended to the
+    delivered text (not the stored run artifact), marked sent only when the
+    brief went; everyone else's are made due when those briefs run
+    (only the principal gets briefs); a digest row unclaimed for 36 h goes
+    on its own. Switching back to instant releases what waited. Cap 50 open
+    rows per person (oldest dropped).
+    Urgent: source nudge_stalled (approval nudges) and alert-review DMs
+    about an alert whose severity is or becomes `urgent`
+    (notifications.urgent_send) are let through when urgent_through. A
+    workflow approval question (gate_delivery wraps message_person in
+    notifications.approval_send) is never held, whatever the setting: only
+    a reply to it resolves the gate. If quiet hours cover every
+    availability window in the 14-day horizon, next_window_for falls back
+    to the next window rather than dropping the nudge.
+    Not covered: nudges on the email channel (the MCP mail tool bypasses the
+    send handlers — routing still defers them for quiet hours, but they are
+    never digest-held); department channel broadcasts (rooms, not a person);
+    alerts.dispatcher channels (web SSE, a self-addressed email, and a Slack
+    DM stub); Act as me approval cards (untagged, and approvals anyway).
+    Department check-ins send no DM: their proposals become approval cards.
   scope_tokens: |
     People can be queried by scope token via
     GET /people/by-scope/{token} — e.g. "ceo", "head-of-marketing",
@@ -4332,7 +4585,7 @@ scheduler:
     nudge engine's dedup lookup.
   kinds:
     - ad_hoc — user-facing follow-ups created by the Executive's `schedule_followup` tool. Default kind.
-    - "dept_cadence — internal action fired by department cadences. Not authority-gated (the check-in sends nothing). The runner first applies the skip rule (`department_check_in.needs_check_in` — no specialist, no Goals, or nothing new since the Goals were last reviewed; see `departments.cadence`) before creating any run; otherwise it invokes the `department_check_in` workflow. Every outcome re-enqueues the next occurrence via `cadence.enqueue_next` (idempotently) — a run, a skip, and a failure once its retries are spent. A skip is recorded `cancelled` with `skipped: <reason>` in `last_error`, so it never counts as a check-in that ran. In a solo workspace the runner marks the row `cancelled` (reason in last_error) without running it and without chaining — ahead of the authority gate, so a propose_only department cannot turn it into an approval card; cancelled rather than done, because the nudge engine reads a done dept_cadence row as a recent department pulse. Pending rows are cancelled when their department is deleted, and orphaned rows (department no longer exists) are swept by `cadence.cancel_orphaned_cadences` on lifespan boot."
+    - "dept_cadence — internal action fired by department cadences. Not authority-gated (the check-in sends nothing). The runner first applies the skip rule (`department_check_in.needs_check_in` — no specialist, no Goals, or nothing new since the Goals were last reviewed; see `departments.cadence`) before creating any run; otherwise it invokes the `department_check_in` workflow. Every outcome re-enqueues the next occurrence via `cadence.enqueue_next` (idempotently) — a run, a skip, and a failure once its retries are spent. That last case also files one Home card (`workflows.failure_alerts`, source `workflow_failed`, tag `failed_run:<run id>`, coalesced per department) whose Run again (`POST /workflows/runs/{id}/rerun`) queues a dept_cadence row due now with `scope_key` `rerun:<run id>`, which bypasses the skip rule; a failed dynamic_workflow files the same card routed to its recipient, and its rerun row skips `schedule_dynamic_workflow_cadence`. A skip is recorded `cancelled` with `skipped: <reason>` in `last_error`, so it never counts as a check-in that ran. In a solo workspace the runner marks the row `cancelled` (reason in last_error) without running it and without chaining — ahead of the authority gate, so a propose_only department cannot turn it into an approval card; cancelled rather than done, because the nudge engine reads a done dept_cadence row as a recent department pulse. Pending rows are cancelled when their department is deleted, and orphaned rows (department no longer exists) are swept by `cadence.cancel_orphaned_cadences` on lifespan boot."
     - awaiting_human — placed by the `wait_for_human` workflow step; the run resumes when an inbound message matches.
     - "dynamic_workflow — cadence-fired run of a user-created (dynamic) workflow. Enqueued by `workflows.dynamic_cadence.schedule_dynamic_workflow_cadence` (channel=`__internal__`, channel_ref=the workflow name, assigned_to_person_id=the delivery recipient). The runner's `_run_dynamic_workflow` resolves the stored definition, runs the generic `DynamicWorkflow`, DMs the artifact to the recipient via `handle_message_person`, and re-chains the next occurrence — same crash-survival pattern as the principal briefs. Saving/updating/deleting/deactivating the definition reconciles its pending rows via `dynamic_cadence.cancel_cadence_rows`. See the `workflows:` → `dynamic_user_created` key."
     - nudge_scan — internal heartbeat row owned by the nudge engine; the runner calls `nudge_engine.run_nudge_scan()` and chains the next tick via `nudge_engine.enqueue_next_scan()`. Bypasses outbound dispatch. Emission is also capped per `scope_key` at `NUDGE_MAX_PER_SCOPE` (default 3) delivered nudges (`episodic.count_nudges_for_scope`), so a parked item is not chased forever.
@@ -4399,6 +4652,18 @@ scheduler:
     503. Each cancel is audited `scheduled_action_cancelled` with the
     caller's email, "admin-token" or "local" as actor. Before this the UI
     could never send the admin token, so Cancel failed on every deploy.
+  held_messages: |
+    Loop-level hook `_maybe_release_held` (like the reminders): at most once
+    a minute it starts people.held_messages.maybe_release, which sends each
+    person their due held messages (quiet hours ended, or a digest made due
+    when the briefs ran) as one "While you were away" message through
+    deliver_to_person, private audit rows (`held_messages_released`). The
+    principal-brief handler appends the principal's digest rows to the
+    morning brief / EoD digest it delivers (_with_held_messages), marks them
+    sent only on delivery (_mark_held_sent), then _release_others_digests
+    makes everyone else's due. The proactive_nudge re-check calls
+    prefer_channel_for / next_available_window with quiet_hours=True
+    (urgent for `nudge:stalled:` scope keys). See people.notification_settings.
   nudge_engine: |
     openexecutive.scheduler.nudge_engine — periodic heartbeat (kind=
     `nudge_scan`, default every 15 min via NUDGE_SCAN_INTERVAL_MINUTES)
@@ -4583,6 +4848,12 @@ today:
     Read-side only — no writes happen here.
 
 chat:
+  chats_preview: |
+    GET /sessions (no q) gives each chat a preview: the last message as
+    one plain line (Markdown marks stripped, cut at a word near 120
+    chars), "You: " before the person's own words, null for an empty
+    chat. The list's GROUP BY takes MAX(m.id) per chat, then one
+    primary-key IN (...) lookup (batches of 500) reads those messages.
   chats_search: |
     GET /sessions?q= searches the caller's own chats (same scope as the
     list) by title and message text, case-insensitive with LIKE
@@ -4924,7 +5195,7 @@ audit:
     - alert — alert created by the triage pipeline
     - integration_inbound — Slack / Discord / email / Telegram / Google Chat message received. The chat adapters put the first 160 characters of the message in the summary; the email poller keeps the summary to sender and subject and stores the text in the full payload (`message` — the sender's new text, cut at 20,000 escaped JSON chars, the measure the 64 KB cap uses; `attachments` — filenames, 8,000 escaped chars; `body` — the whole body with its quoted chain, only on a row private to the principal, since the chain quotes other people's mail and a public row is every signed-in user's) with `details.preview` (120 chars of the new text) and `details.body_len`, so /audit shows the request next to the reply's `chat_turn` row. `details.outcome` distinguishes the non-reply paths — `rejected_unknown_sender` (not on the People roster), `skipped_gate` (response gate said no), `dropped_thread_unreadable` (Slack wouldn't return a thread the bot is in, so a continuation went unanswered; the sender was told), and `handler_error` (the turn raised; the user got the generic apology). The error row carries the same `session_id` as the inbound row, so /audit can join a failed turn to the message that caused it.
     - knowledge_retrieval — one row per `knowledge.retriever.retrieve()` call; details carry chunk counts + domains, full payload carries each chunk's source, distance, and text preview so the session view shows "which RAG chunks influenced this response"
-    - cache_event — one row per model call, from every call site (`audit.usage.log_model_usage`): Executive iterations and the committee revision pass (`actor` executive / committee_revision), `BaseAgent.analyze` callers — chat-turn consults via `route_parallel` (`actor` specialist), workflow steps and other direct `route_to_specialist` callers (specialist_workflow), the MCP `consult_specialist` tool (specialist_mcp), and both Council test boxes (agent_test) — `BaseAgent.analyze_with_tools` callers (specialist_research, query_watch, signal_enrichment), the research synthesis and watchlist passes (research_synthesis / research_watchlist), triage, the chat memory extractor (memory_extractor), alert review (alert_review), the brief's narrative and grounding repair (briefing_narrative / briefing_grounding), the end_of_day_digest, executive_reflection and weekly_review workflows, wait_for_human reply parsing (workflow replies and roster answers) and the inbound_resolver, committee reviewers (committee_reviewer), the fixture and engagement generators (their agent names), and the utility calls — session_title, response_gate, person_insight, initiatives_consolidation, pdf_reader, the chat page's suggested_prompts / followup_suggestion, and the eval runner's eval_judge. `tests/unit/test_usage_recording.py::test_every_model_call_records_usage` walks the package's AST and fails on any function that calls `messages_create` / `messages_stream` without calling `log_model_usage` (directly, through a same-module wrapper such as the Executive's `_emit_cache_event`, or from an enclosing function), so a new call site cannot skip the row silently; `providers/` and the runtime-dead `architecture/generator.py` are exempt, and the repo-root `evals/` harness (a separate client process with its own SDK client) is out of scope. Captures `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `cost_usd`, `web_search_requests` (from `usage.server_tool_use`), `stop_reason`, and — inside a research run — the run's `run_id`, so prompt-cache hits are visible per turn, plus `cost_usd` — the actual USD OpenRouter charged for the call (read from `usage.cost`; null on the Anthropic-direct path or for rows logged before cost capture shipped). This is the token-usage + cost source of truth aggregated by both `/audit/sessions/{id}` (per session) and `/audit/usage` (cross-session).
+    - cache_event — one row per model call, from every call site (`audit.usage.log_model_usage`): Executive iterations and the committee revision pass (`actor` executive / committee_revision), `BaseAgent.analyze` callers — chat-turn consults via `route_parallel` (`actor` specialist), workflow steps and other direct `route_to_specialist` callers (specialist_workflow), the MCP `consult_specialist` tool (specialist_mcp), and both Council test boxes (agent_test) — `BaseAgent.analyze_with_tools` callers (specialist_research, query_watch, signal_enrichment), the research synthesis and watchlist passes (research_synthesis / research_watchlist), triage, the chat memory extractor (memory_extractor), alert review (alert_review), the brief's narrative and grounding repair (briefing_narrative / briefing_grounding), the end_of_day_digest, executive_reflection and weekly_review workflows, wait_for_human reply parsing (workflow replies and roster answers) and the inbound_resolver, committee reviewers (committee_reviewer), the fixture and engagement generators (their agent names), and the utility calls — session_title, response_gate, person_insight, initiatives_consolidation, pdf_reader, the chat page's suggested_prompts / followup_suggestion, and the eval runner's eval_judge. `tests/unit/test_usage_recording.py::test_every_model_call_records_usage` walks the package's AST and fails on any function that calls `messages_create` / `messages_stream` without calling `log_model_usage` (directly, through a same-module wrapper such as the Executive's `_emit_cache_event`, or from an enclosing function), so a new call site cannot skip the row silently; `providers/` and the runtime-dead `architecture/generator.py` are exempt, and the repo-root `evals/` harness is out of scope (its judges call the package's `evals.judges.judge_message`, which records the eval_judge row and uses `EVAL_JUDGE_MODEL`, default Opus). Captures `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `cost_usd`, `web_search_requests` (from `usage.server_tool_use`), `stop_reason`, and — inside a research run — the run's `run_id`, so prompt-cache hits are visible per turn, plus `cost_usd` — the actual USD OpenRouter charged for the call (read from `usage.cost`; null on the Anthropic-direct path or for rows logged before cost capture shipped). This is the token-usage + cost source of truth aggregated by both `/audit/sessions/{id}` (per session) and `/audit/usage` (cross-session).
     - memory_snapshot — one row at Executive turn entry; captures the system-block layout, conversation history length, episodic context (full text in `full_json`), and a company-profile hash so the session view can render "what the agent saw" before any API call
     - committee_review — one row per committee-reviewed turn; carries draft length, final length, per-reviewer critiques and timings (previously emitted but newly declared as a recognised event_type)
     - peer_memory — one row per `openexecutive.memory.honcho_client` call (prefetch / sync_turn / seed_identity / directional_chat / prefetch_department / sync_department_turn / append_department_note); carries `op`, `person_id`, optional `department_slug`, `outcome` (ok / timeout / error / disabled / no_person / no_department / no_loop / empty), `duration_ms`, plus op-specific details (query preview, reasoning_level, peer count, co_present_person_ids, co_present_department_slugs, originating_person_id, target_person_id, session_id, kind) so the flow-chart view renders the peer_memory path alongside `<retrieved_context>` and `<past_decisions>`. Disabled / no-Person / no-Department turns still emit (outcome marker) so audit absence equals "code path never ran" instead of "the provider was down."
@@ -6046,7 +6317,16 @@ workflows:
     typed; it is also the fallback when storage is blocked, so then nothing
     is sent until the user presses Start. Below the panel: the user's custom
     workflows, four ready-made starter picks, and the full built-in list
-    folded behind "Browse all" (`?browse=1`). A dynamic
+    folded behind "Browse all" (`?browse=1`). The picks and the example
+    chips follow the workspace mode (`starterPicksFor` /
+    `workflowStarterChipsFor` in lib/workflowStarters.ts): a team gets
+    investor_update, board_prep, mbr and competitive_teardown and a board
+    pre-read chip; solo ("Just you", an owner-operator) gets mbr,
+    pricing_review, churn_deep_dive and quarterly_plan, and chips for a
+    Friday cash and pipeline check, customers who stopped buying and the
+    competitor digest. tests/unit/test_jobs_starter_picks.py pins every
+    pick to a WORKFLOW_REGISTRY entry that is not background and not
+    principal-only in its mode. A dynamic
     workflow is a stored JSON definition (the `dynamic_workflows` table;
     `openexecutive.workflows.dynamic_store`) interpreted at runtime by ONE
     generic engine, `openexecutive.workflows.dynamic.DynamicWorkflow`, which
@@ -6623,8 +6903,14 @@ workflows:
     - Briefs (`ground_brief`, morning_brief + end_of_day_digest, after the
       quiet fallback): one repair call to the fast model with the list of
       ungrounded items; still-ungrounded lines are dropped, then headers
-      left empty; a "_Held back N lines …_" note is appended (all of it →
-      the HELD_BACK_ALL line). Each grounded figure then gets a server-chosen
+      left empty; an "_I left out N lines … under Left out of your brief on
+      Home._" note is appended (all of it → the HELD_BACK_ALL line). Every
+      held line is kept in the audit row's untruncated `full` payload (the
+      4 KB `details` cap would cut a list), and `recent_held_back` reads the
+      last day's back for `GET /today` `held_back` — principal only, set
+      after the narrative inputs are taken so held lines never reach a
+      prompt. Before this the note said "/today has the full list", and
+      nothing there listed them. Each grounded figure then gets a server-chosen
       ` [n]` (the value-matching line with the most words in common with the
       figure's clause) and a `**Sources**` list at the end (`- [n] <section>
       — <snippet>`, snippets stripped of []()<>*_`| and cut to 90 chars, at
@@ -6662,7 +6948,7 @@ workflows:
     - inbound_resolver — matches human replies back to paused workflow runs.
     - crisis_comms — drafts incident response messaging.
     - churn_deep_dive — structured customer-loss analysis.
-    - "morning_brief — Shift 3 recurring workflow. Fires once per day from the scheduler (default 08:00 in the user's zone; an explicit PRINCIPAL_BRIEF_MORNING_TIME env var is read as UTC). Targets the principal: utility_fast model renders a ≤200-word Markdown briefing. CHANGE-AWARE: the window is 'since the last DELIVERED morning brief' (`briefing.brief_state.since_for`, 24 h on a cold store, clamped to 7 d); activity comes from `_build_activity(20, since=…)`; proposals (action category only) split into NEW SINCE LAST BRIEF (enumerated, with why_now / next move) vs a one-line CARRIED OVER count (with the likely-stale count); a REWRITTEN block lists carried items the review rewrote in the window (`brief_state.rewritten_since`: verdict `changed`, still open — reported under 'what changed', never as done); a HANDLED OVERNIGHT block lists the alert review's completed moves (`brief_state.handled_since`, `changed` excluded). Section order: top call → what changed → handled overnight → needs you (new only) → waiting on → at risk. A fingerprint of the inputs (`build_brief_fingerprint`, date-free) is compared to the last delivered one: unchanged ⇒ the artifact is the one-liner 'Nothing new since yesterday's brief — N items still waiting on you.' and no model call (`PRINCIPAL_BRIEF_SUPPRESS_UNCHANGED`, bypass with `force_full=true` on a manual run). The workflow yields a `result` event `{brief_fingerprint, suppressed, since}`; only `_run_principal_brief` records the fingerprint, after a successful delivery (`brief_state.record_delivered`, stored in `briefing_narrative` under scope `brief:<kind>`). Delivery (`scheduler.runner._deliver_to_principal`, also used for the client-rotation digest): the principal's `preferred_channel` (slack / discord / telegram / email / any) maps to slack_dm / discord_dm / telegram / email and is tried first, then the other chat channels they have an id for in the order slack_dm → discord_dm → telegram. Email goes through the active MCP gateway when it runs the Google Workspace server (`runner.email_ready()`: another MCP server alone does not make email ready) (`google_workspace__send_gmail_message`, `user_google_email` = the Executive's own address, `to` = the principal's email, subject `<workflow title> — <local date>` in the user's zone, e.g. 'Morning Brief — Fri 25 Sep' (`_email_subject`; a UTC date put tomorrow's date on an evening digest west of UTC); body_format html, the Markdown rendered by `utils.markdown_email` (markdown-it-py: raw HTML off, so quoted outside text shows as text; images off, so opening the email loads nothing remote; javascript:/vbscript:/file:/data: links dropped); an in-band error counts as failed, `workflows.action_step.looks_like_error`). Email is tried first when the preference is `email`, and otherwise last, as the backup after every chat channel: delivery stops at the first channel that sends, so an owner linked by email at setup (`any`) with a working Slack still gets no email — only when every chat channel is missing or fails. Email is not a DM, so the per-Person outbound guard does not apply; the gateway's roster egress gate does. `_deliver_to_principal` returns a `PrincipalDelivery(ok, detail, reason, channel)`; reason is delivered | no_owner | no_channel | send_failed. The order comes from `runner.delivery_order` via `runner.principal_delivery_plan()` — public, because the Briefing notice and the Setup status light use them too. When no channel can deliver (e.g. a web-only principal, or email-only with no gateway) the brief is still generated and stored as a run with its artifact, exactly as before; it is not delivered (audited `delivery_failed`), so the window and fingerprint do not advance, and the next occurrence is chained. Every run's outcome is recorded (`brief_state.record_delivery_outcome`, scope `brief_delivery:<kind>`: the reason, and the channel that sent it — a channel name, never an address), including `not_written` when the workflow raised, emitted an error or produced no artifact (then nothing is sent), and `send_failed` when delivery itself raised. `last_delivery_outcome()` returns the latest of the two briefs and the (solo) weekly review (`brief_state.DELIVERY_KINDS`; `BRIEF_KINDS` stays the two daily briefs, whose send times the Setup page lists). `current_problem(outcome, has_owner, can_deliver)` says what still keeps it from the owner: send_failed and not_written stay reported until the next brief records a new outcome; having nowhere to send it is judged from now, so a fix clears it and a partial fix reports what is left (an owner added but still no channel reads no_channel). `GET /today/brief-delivery` (the Briefing's notice, owner only, null while the scheduler is off) and the Setup status 'Daily brief' light read it; brief names come from `scheduler.action_phrasing.KIND_LABEL` (`brief_state.brief_name`). SOLO: with effective_workspace_mode solo it uses STANDALONE_BRIEF_SOLO_SYSTEM (top call → what changed → handled overnight → needs you → due this week → goals at risk, named by area; no waiting-on or department sections) over the solo context render, which adds today_data['due_soon'] (open_loops.principal_due_soon: the principal's open loops overdue or due within 7 days) as a DUE THIS WEEK block, and the fingerprint carries the mode, drops the people-awaiting set and, when there are due items, carries them as (loop_id, state) pairs. TOP THREE TODAY (solo only, the DM brief only): `briefing.top_three.build_top_three` picks up to three in code — overdue then due-today commitments, off-track then at-risk goals (by area), commitments due later this week, then active initiatives stalest first — and renders them as a TOP THREE TODAY block the solo prompt turns into a 'Top three today' section right after the top call. When `runner.google_workspace_ready()` (gateway up and the Google Workspace server configured) and the principal has an email, ONE `google_workspace__get_events` call (asyncio.wait_for, 4 s) lists today's events (local midnight to midnight, sent as UTC) on the principal's calendar — `calendar_id` = their address, read as the Executive's account (`user_google_email` = EXEC_EMAIL_ADDRESS), or `primary` when that IS the principal's address; `parse_events` reads workspace-mcp's text listing or JSON and treats an error, a timeout or an unknown shape as NO calendar (never as a free day). With a calendar each item gets its own free block (an hour, never under 30 min) inside CALENDAR_BUSINESS_HOURS_START/_END, not before now, all-day events not blocking, plus a TODAY'S CALENDAR block (titles quoted as data); without one there are no slots and no calendar block. The calendar is read only when something was picked, and nothing here can fail the brief. The fingerprint adds the items' keys (`loop:N:state`, `goal:N:status`, `project:N` — no dates, no slot times) and only a coarse `calendar_hash` (busy blocks rounded to 15 min + the all-day count, no titles, no dates), each only when present, so an unchanged day still suppresses and a solo install with nothing picked keeps its old fingerprint. A day whose calendar read times out after one that did not (or the reverse) changes the fingerprint once — accepted. No slots on a non-business day (`calendar_tools.is_business_day`, shared with the booking caps), though the day's events are still listed. Only a date-only event is all day; a zero-length timed event is listed but blocks nothing; an event whose times cannot be read is dropped from the listing, the busy time and the all-day count, and a reply that lists events but none readable counts as no calendar (never a free day). Logs carry only the reply's length or the exception type — never reply text."
+    - "morning_brief — Shift 3 recurring workflow. Fires once per day from the scheduler (default 08:00 in the user's zone; an explicit PRINCIPAL_BRIEF_MORNING_TIME env var is read as UTC). Targets the principal: utility_fast model renders a ≤200-word Markdown briefing. CHANGE-AWARE: the window is 'since the last DELIVERED morning brief' (`briefing.brief_state.since_for`, 24 h on a cold store, clamped to 7 d); activity comes from `_build_activity(20, since=…)`; proposals (action category only) split into NEW SINCE LAST BRIEF (enumerated, with why_now / next move) vs a one-line CARRIED OVER count (with the likely-stale count); a REWRITTEN block lists carried items the review rewrote in the window (`brief_state.rewritten_since`: verdict `changed`, still open — reported under 'what changed', never as done); a HANDLED OVERNIGHT block lists the alert review's completed moves (`brief_state.handled_since`, `changed` excluded). Section order: top call → what changed → handled overnight → needs you (new only) → waiting on → at risk. A fingerprint of the inputs (`build_brief_fingerprint`, date-free) is compared to the last delivered one: unchanged ⇒ the artifact is the one-liner 'Nothing new since yesterday's brief — N items still waiting on you.' and no model call (`PRINCIPAL_BRIEF_SUPPRESS_UNCHANGED`, bypass with `force_full=true` on a manual run). The workflow yields a `result` event `{brief_fingerprint, suppressed, since}`; only `_run_principal_brief` records the fingerprint, after a successful delivery (`brief_state.record_delivered`, stored in `briefing_narrative` under scope `brief:<kind>`). Delivery (`scheduler.runner._deliver_to_principal`, also used for the client-rotation digest): the principal's `preferred_channel` (slack / discord / telegram / email / any) maps to slack_dm / discord_dm / telegram / email and is tried first, then the other chat channels they have an id for in the order slack_dm → discord_dm → telegram. Email goes through the active MCP gateway when it runs the Google Workspace server (`runner.email_ready()`: another MCP server alone does not make email ready) (`google_workspace__send_gmail_message`, `user_google_email` = the Executive's own address, `to` = the principal's email, subject `<workflow title> — <local date>` in the user's zone, e.g. 'Morning Brief — Fri 25 Sep' (`_email_subject`; a UTC date put tomorrow's date on an evening digest west of UTC); body_format html, the Markdown rendered by `utils.markdown_email` (markdown-it-py: raw HTML off, so quoted outside text shows as text; images off, so opening the email loads nothing remote; javascript:/vbscript:/file:/data: links dropped); an in-band error counts as failed, `workflows.action_step.looks_like_error`). Email is tried first when the preference is `email`, and otherwise last, as the backup after every chat channel: delivery stops at the first channel that sends, so an owner linked by email at setup (`any`) with a working Slack still gets no email — only when every chat channel is missing or fails. Email is not a DM, so the per-Person outbound guard does not apply; the gateway's roster egress gate does. `_deliver_to_principal` returns a `PrincipalDelivery(ok, detail, reason, channel)`; reason is delivered | no_owner | no_channel | gateway_down | send_failed. `gateway_down` is email set up (the mail server in the MCP config, the principal has an address) but no active gateway: the Executive's fault, recorded with the supervisor's start failure (`mcp_gateway.gateway_problem`) instead of `no_channel`, which told the owner to connect what they had. A `send_failed` detail quotes each channel's own error (`email: invalid_grant …; slack_dm: channel_not_found`), stored with the outcome (`record_delivery_outcome(detail=…)`, JSON in the row's text, older bare-channel rows still read) and repeated by the notice and the Daily brief light (`brief_state.describe_problem`, whose fix says to reconnect when the detail shows a dead grant). Before planning, `_deliver_to_principal` / `deliver_to_person` run the lazy re-check `runner.ensure_email_ready` → `mcp_gateway.ensure_active_gateway`: with the gateway down and no attempt running, the supervisor (`orchestrator.gateway_boot.GatewaySupervisor`) tries a start now rather than waiting for its next backoff retry, so a gateway that failed at boot can still carry this brief; `_execute_action` resolves the gateway the same way instead of keeping the None boot handed the scheduler. The order comes from `runner.delivery_order` via `runner.principal_delivery_plan()` — public, because the Briefing notice and the Setup status light use them too. When no channel can deliver (e.g. a web-only principal, or email-only with no gateway) the brief is still generated and stored as a run with its artifact, exactly as before; it is not delivered (audited `delivery_failed`), so the window and fingerprint do not advance, and the next occurrence is chained. Every run's outcome is recorded (`brief_state.record_delivery_outcome`, scope `brief_delivery:<kind>`: the reason, and the channel that sent it — a channel name, never an address), including `not_written` when the workflow raised, emitted an error or produced no artifact (then nothing is sent), and `send_failed` when delivery itself raised. `last_delivery_outcome()` returns the latest of the two briefs and the (solo) weekly review (`brief_state.DELIVERY_KINDS`; `BRIEF_KINDS` stays the two daily briefs, whose send times the Setup page lists). `current_problem(outcome, has_owner, can_deliver)` says what still keeps it from the owner: send_failed and not_written stay reported until the next brief records a new outcome; having nowhere to send it is judged from now, so a fix clears it and a partial fix reports what is left (an owner added but still no channel reads no_channel). `GET /today/brief-delivery` (the Briefing's notice, owner only, null while the scheduler is off) and the Setup status 'Daily brief' light read it; brief names come from `scheduler.action_phrasing.KIND_LABEL` (`brief_state.brief_name`). SOLO: with effective_workspace_mode solo it uses STANDALONE_BRIEF_SOLO_SYSTEM (top call → what changed → handled overnight → needs you → due this week → goals at risk, named by area; no waiting-on or department sections) over the solo context render, which adds today_data['due_soon'] (open_loops.principal_due_soon: the principal's open loops overdue or due within 7 days) as a DUE THIS WEEK block, and the fingerprint carries the mode, drops the people-awaiting set and, when there are due items, carries them as (loop_id, state) pairs. TOP THREE TODAY (solo only, the DM brief only): `briefing.top_three.build_top_three` picks up to three in code — overdue then due-today commitments, off-track then at-risk goals (by area), commitments due later this week, then active initiatives stalest first — and renders them as a TOP THREE TODAY block the solo prompt turns into a 'Top three today' section right after the top call. When `runner.google_workspace_ready()` (gateway up and the Google Workspace server configured) and the principal has an email, ONE `google_workspace__get_events` call (asyncio.wait_for, 4 s) lists today's events (local midnight to midnight, sent as UTC) on the principal's calendar — `calendar_id` = their address, read as the Executive's account (`user_google_email` = EXEC_EMAIL_ADDRESS), or `primary` when that IS the principal's address; `parse_events` reads workspace-mcp's text listing or JSON and treats an error, a timeout or an unknown shape as NO calendar (never as a free day). With a calendar each item gets its own free block (an hour, never under 30 min) inside CALENDAR_BUSINESS_HOURS_START/_END, not before now, all-day events not blocking, plus a TODAY'S CALENDAR block (titles quoted as data); without one there are no slots and no calendar block. The calendar is read only when something was picked, and nothing here can fail the brief. The fingerprint adds the items' keys (`loop:N:state`, `goal:N:status`, `project:N` — no dates, no slot times) and only a coarse `calendar_hash` (busy blocks rounded to 15 min + the all-day count, no titles, no dates), each only when present, so an unchanged day still suppresses and a solo install with nothing picked keeps its old fingerprint. A day whose calendar read times out after one that did not (or the reverse) changes the fingerprint once — accepted. No slots on a non-business day (`calendar_tools.is_business_day`, shared with the booking caps), though the day's events are still listed. Only a date-only event is all day; a zero-length timed event is listed but blocks nothing; an event whose times cannot be read is dropped from the listing, the busy time and the all-day count, and a reply that lists events but none readable counts as no calendar (never a free day). Logs carry only the reply's length or the exception type — never reply text."
     - "morning_brief (live world, since the principal-brief rework) — besides the board it reads `live_signals.gather_live_signals(since)`: inbound, stuck, the principal's chats, and today's calendar read fresh in BOTH modes (`refresh_calendar(max_age=0)`) unless the solo top three already rendered TODAY'S CALENDAR. It carries the latest executive_reflection run's 'Flagged for the brief' bullets finished inside the window (`brief_state.reflection_flags_since`, via `persistence.get_run` since list_runs omits the artifact) and drops rhythm runs from its activity (`_build_activity(exclude_workflows=RHYTHM_WORKFLOWS)`): their dated titles moved the fingerprint daily so suppression never fired. Team section order: top call → today → what changed (inbound first) → handled overnight → needs you → waiting on → at risk (the slipping goal or the department left out). Period is the local date. PRIVACY: private rows (the principal's contacts' alerts via `_build_today(include_private=True)`, private audit rows, drafts, chats, the calendar) are read only when `morning_brief.PRINCIPAL_DELIVERY` is set (the scheduler sets it around `_run_principal_brief`) or on the principal's own verified chat turn in a conversation only they can read (`is_principal_on_verified_surface` AND `delegation.settings.private_conversation`: web chat, Slack/Discord DM, private Telegram — never a shared channel, where the reply is posted for everyone). A run that used one reports `private_to_principal` on its result event; the scheduler, `run_workflow` and `POST /workflows/{name}/runs` then store `persistence.PRIVATE_RUN_ARTIFACT` via `stored_artifact` (private_used compares every key and count of the live read with the shared one), because /workflows/runs is readable by every signed-in user. The fingerprint adds `live_keys` (time-free: sender|subject|count, stuck lines, drafts count, conversation titles, calendar shape) and the reflection flags only when non-empty, so a caller passing neither keeps its old fingerprint. INFO log 'morning_brief: context since=… inbound=… stuck=… private_used=… suppressed=…'."
     - "end_of_day_digest — Shift 3 recurring workflow. Fires once per day from the scheduler (default 18:00 in the user's zone; an explicit PRINCIPAL_BRIEF_EOD_TIME is read as UTC). Same shape as morning_brief but framed as a recap since the last DELIVERED digest (`brief_state.since_for`, 24 h on a cold store): what OE did today (activity since), alerts it handled today (completed moves only; rewritten-but-open items render as a REWRITTEN block under still pending), what's still pending (NEW SINCE LAST BRIEF, action category only, carried-over as one line), what's at risk for tomorrow, one optional 'sleep on this' question. Same fingerprint / one-liner suppression and `force_full` as morning_brief, under scope `brief:principal_brief_eod`. SOLO: _EOD_DIGEST_SOLO_SYSTEM (what I did today → open decisions → goals at risk tomorrow by area → sleep on this) over a context with GOALS AT RISK BY AREA and no people-waiting block."
     - "weekly_review — the principal's weekly look back and ahead (background; inputs all defaulted; playbook `weekly-review`). Steps: goals (every area with goals graded concurrently by its own specialist with the check-in's verdict contract `_parse_verdicts` and write-back `department_check_in.persist_goal_verdicts` → `record_goal_review`, one `goal_status_review` audit row per area with actor `weekly_review`; no goals → skipped, no specialist → listed ungraded, specialist failure → shown as last recorded) → commitments (`open_loops.principal_due_soon`, overdue or due within 7 days) → projects (active initiatives with no update for 7+ days) → decisions (`episodic.decisions_since`, the last 7 days) → revisit (`episodic.decisions_awaiting_outcome`: at most 3 decisions older than 30 days with an empty or whitespace outcome, newest first, shown as [decision N]) → assemble. Every section always renders, with a one-line note when empty. Next week's top 3 comes from one fast-model call (constant `WEEKLY_TOP_THREE_SYSTEM`; the playbook and the review ride in the user turn) trimmed to at most three list items, or — on failure or an empty reply — the ranked pick `briefing.top_three` uses. Yields a `result` event (areas graded/ungraded, due count, quiet project ids, the week's and the revisit decision ids). Role-neutral wording; says area in solo and department in team. Scheduled weekly in solo only (`principal_weekly_review`, see the scheduler key). The artifact starts with `TITLE_PREFIX` + the period and ends with the `TOP_THREE_HEADING` section; `summarize_review(artifact)` reads those back as plain text ({period, top_three, excerpt}) for the solo Briefing's 'This week's review' card (GET /today/weekly-review, see the today key). Evals: `workflow_weekly_review_001`."
@@ -7129,6 +7415,34 @@ integrations:
     The old env-var allowlists (EMAIL_ALLOWED_SENDERS /
     TELEGRAM_ALLOWED_CHAT_IDS / DISCORD_ALLOWED_USER_IDS) have been
     removed; access is managed entirely via the /people UI.
+  mcp_tool_timeout: |
+    Every call through MCPGateway to the extensible-mcp child (call_tool,
+    search_tools, load_mcp_server and the M365 gate lookups in
+    _fetch_m365_json) goes through mcp_gateway._session_call, which bounds
+    it with MCP_TOOL_TIMEOUT_S (120 s) and raises GatewayCallTimeout (a
+    TimeoutError) past it. MCPGateway.call_tool turns that into an error
+    payload ({"error": "... did not answer within N s. It may still have
+    run ...", "timed_out": true}) and skips everything after the call: no
+    outbound linkage, artifact row or grant-health reading for a call that
+    may not have happened. Gate lookups read a timeout as a failed lookup
+    (None), which the gates refuse on. Why: a hung workspace server held
+    whatever awaited it for good: the serial email poller, a brief, a chat
+    turn until its whole-turn deadline. The server is not told to cancel,
+    so a send that timed out may still go: the roster acknowledgement
+    (roster_intake.send_email_ack) raises AckUncertain on a timed_out
+    payload and keeps its claim (roster_ack_uncertain row) so no second
+    acknowledgement follows, and a turn cut off with MCP calls in flight
+    writes a CANCELLED tool_invocation row for each (Executive agent loop).
+  chat_stream_keepalive: |
+    The /chat SSE body sends ": keepalive\n\n" (an SSE comment, skipped by
+    every reader; the UI reads only data: lines) when CHAT_STREAM_KEEPALIVE_S
+    (15 s, 0 = off) passes with the Executive's step still running.
+    _next_stream_step waits min(remaining, keepalive) and returns idle with
+    the step still in flight (pending); the loop yields the comment and
+    passes pending back, so nothing restarts. Every other exit cancels the
+    step, and the loop's finally cancels a pending one before the stream's
+    aclose. The whole-turn deadline is unchanged. Why: browsers and proxies
+    drop an idle stream well inside CHAT_STREAM_TIMEOUT_S.
   email_poller: |
     MCP poll loop in openexecutive.integrations.email_poller — runs
     as an asyncio task in the FastAPI lifespan, started by
@@ -7160,6 +7474,16 @@ integrations:
     block. The outbound gate at ``mcp_gateway._check_gmail_recipients`` /
     ``_check_m365_recipients`` is the actual security boundary against
     auto-replying to spam.
+    Deadlines: the loop is serial (one message at a time), so the
+    Executive turn on each email runs under asyncio.timeout
+    (EMAIL_TURN_TIMEOUT_S, 300 s). Past it the turn is cancelled
+    (EmailTurnTimeout; a TimeoutError raised inside the turn is not
+    mistaken for it), an integration_inbound row with outcome turn_timeout
+    is written (private when the mail is), and the message is marked read
+    and not run again, since the turn may already have replied. A message
+    whose handling raises is retried on the next polls up to _MAX_ATTEMPTS
+    (3) per run, then given up and marked read. Every gateway call it makes
+    is bounded by MCP_TOOL_TIMEOUT_S (see mcp_tool_timeout).
     Mail from one of the principal's CONTACTS gets a contact [POLICY]
     notice instead (`_contact_notice`): it names them (name, role /
     company), says not to reply unless the principal asks, and asks for
@@ -7311,7 +7635,36 @@ integrations:
     ``start_async()`` (sleep-forever) must never be used there.
     Handlers await on the application event loop, which is what keeps
     the uvicorn-bound MCP gateway, the shared AsyncAnthropic client and
-    the SSE queues off a foreign loop. Responds to (a) ``@mention``
+    the SSE queues off a foreign loop. EVENTS OVER HTTP: with
+    ``SLACK_SIGNING_SECRET`` set and no ``SLACK_APP_TOKEN`` (Socket Mode
+    wins when both are set), the same Bolt app is built with the signing
+    secret and an ``AsyncSlackRequestHandler``, and Slack posts events to
+    ``POST /webhook/slack`` (integrations.slack_events, mounted at import so
+    main.py never imports slack_bolt; it answers 503 until the lifespan
+    sets the handler). The route itself checks the v0 signature (constant
+    time, timestamp within 300 s, ASCII digits only, body capped at 1 MB)
+    BEFORE handing the request to Bolt, because Bolt logs the whole body of
+    a request that fails its own check (at INFO, which the process runs at)
+    and raises on an unparseable body or timestamp: unsigned traffic would
+    otherwise write anything into the log. A signed body Bolt can't parse is
+    400. A signed request is then taken once: the route remembers the exact
+    x-slack-signature of each request it hands to Bolt (an identical replay
+    of any signed body inside the window carries the same one) and the
+    event_id of an event_callback body (unchanged across Slack's re-signed
+    retries), in a per-process in-memory set (TTL 660 s, twice the signature
+    window plus slop; at most 10,000 keys, oldest dropped first), and answers
+    a repeat 200 with an empty body without reaching Bolt, so Slack stops
+    retrying. Keys are recorded before Bolt runs (concurrent copies are
+    caught) and forgotten if Bolt raises or answers 5xx. Per process means
+    one machine; a restart forgets the set.
+    Bolt then verifies again, answers url_verification, and acks at once while
+    the listener runs (Slack resends an event not acked within 3 s). The
+    route is in _UNAUTHENTICATED_PATHS and passes the local-login Host
+    gate as a self-verifying webhook. In BOTH modes a global middleware
+    drops an event_callback whose event_id was already taken (bounded
+    in-memory set) or that was delivered for another workspace than the
+    bot token's (team_id / authorizations vs authorize_result.team_id).
+    Responds to (a) ``@mention``
     events, (b) DMs, and
     (c) thread continuations: any non-mention message in a thread the
     bot has previously replied in is treated as a continuation and run
@@ -8270,6 +8623,12 @@ integrations:
         step — the user asked to meet now) and SKIPS the horizon + business-hours/
         weekday caps; still enforces roster, principal-protect, max-attendees, and
         max-events/day, and records an `executed` ledger row for audit.
+        Since nothing approves it, it (and cancel_calendar_event) runs only when
+        someone on the team asked on a verified surface
+        (calendar_tools._asked_on_a_verified_surface: the principal, or a
+        rostered teammate never in an email-started turn); otherwise it refuses.
+        Team mode's create_calendar_event that operations would auto-execute
+        is proposed instead on such a turn.
       cancel_calendar_event  — cancel by decision_instance_id. Only a
         meeting_scheduling instance, and one whose payload is private (a
         meeting with the principal's contact) only when contacts are reachable
@@ -8578,12 +8937,29 @@ company_onboarding:
     because FastAPI's 422 body echoes the rejected input).
   session_state: |
     In-memory OrderedDict in api/routes/onboarding.py, 2h TTL and a 50-session
-    cap, swept on every handler and after each insert. Deliberately NOT
-    persisted: the transcript is unedited free text containing financials, and
-    the artifact worth keeping (the draft) is already in the client's hands.
-    GET /onboard/interview/{id} covers the common loss case (page refresh); a
-    process restart mid-interview loses the interview, consistent with /demo
-    and /clients/generate. Single-process assumption, same as the scheduler.
+    cap, swept on every handler and after each insert, PLUS a write-through
+    copy in the episodic SQLite database (onboarding/interview_store.py, table
+    onboarding_interviews: session_id, payload JSON, updated_at; same TTL and
+    cap, enforced on every save). `_get_interview` reads the store when the
+    process does not hold the id, so a deploy or restart mid-interview, or a
+    second worker, no longer loses the interview. The row is deleted the
+    moment the commit succeeds (the transcript is unedited free text with the
+    company's financials; the profile is on disk) and when the TTL sweep
+    evicts it; a store failure is a warning, never a failed turn. Every
+    store call also sweeps expired and over-cap rows, PRAGMA secure_delete
+    zeroes deleted pages, and a blank client slot wipes the table
+    (clients/slots._BLANK_WIPE_TABLES). A session belongs to whoever
+    started it (InterviewSession.owner_key = api_caller.identity_key):
+    every read or turn by another caller is the same 404 an unknown id
+    gets, since the id alone is no longer a capability once sessions
+    outlive the process and a browser remembers its id. A held copy is
+    replaced by a newer stored row (`load(newer_than=stored_at)`), so two
+    workers never overwrite each other's turns. The browser keeps only the
+    session id (localStorage `oe.onboard.session`, lib/firstRun.ts) plus
+    the description typed before Continue (sessionStorage, cleared by
+    "later" and by Continue), and
+    GET /onboard/interview/{id} resumes at the same question or draft; a 404
+    (saved, expired) clears the memory and starts fresh.
   write_once_commit: |
     The interview NEVER writes. POST /onboard/interview/commit is the single
     write, ordered so nothing observable changes until the atomic save
@@ -8661,7 +9037,17 @@ company_onboarding:
     (the review screen pre-fills it; Setup status's owner light and the
     roster tools' refusal send them here, since the People page refuses
     them); a rostered teammate's own address is on their own entry, which
-    check_owner_email refuses. Decision: re-running setup stays open to
+    check_owner_email refuses. One case is adopted, not refused: the
+    address is the caller's own sign-in (api_caller.caller_email), it is on
+    the current principal's row, and that row carries another name (a
+    hosted sign-up seeds the owner's row from the address when no name was
+    given; or an old spelling). check_owner_email(caller_email=...) lets it
+    through and `adopt_owner_row` renames that row to the drafted name
+    right before save_onboarding_people, so the name-keyed upsert updates
+    the owner's entry instead of adding a namesake and then failing the
+    email check with "use the owner's name exactly as on the People page".
+    Guarded: never for another caller, never onto a name already on the
+    roster, no-op when the names already match. Decision: re-running setup stays open to
     anyone signed in who keeps the owner — PATCH /company-profile and the
     department routes already let them change the same profile and
     departments, so closing setup alone would protect nothing and would
@@ -8690,9 +9076,23 @@ company_onboarding:
     episodic store; the fixture generator may invent because it is building
     fiction. This gap is a decision, not an oversight.
   ui: |
-    /onboard — app/onboard/page.tsx phase machine (conversation -> draft ->
-    redirect), components/onboard/{OnboardConversation,OnboardDraftReview,
-    OnboardPeopleDraft,OnboardDepartmentsDraft}.tsx. The draft screen reuses
+    /onboard — app/onboard/page.tsx phase machine (describe -> confirm ->
+    conversation -> draft -> voice -> done), components/onboard/
+    {OnboardDescribe,OnboardConversation,OnboardDraftReview,OnboardPeopleDraft,
+    OnboardDepartmentsDraft,OnboardDone}.tsx. First run: the owner (the
+    principal, per /people/me) is sent to /onboard from Home and from every
+    AppShell page except /settings while /health says no profile exists
+    (useFirstRunRedirect; rule shouldRedirectToOnboard in lib/firstRun.ts),
+    unless they pressed "I'll do this later" (localStorage `oe.onboard.later`).
+    The done screen shows what was saved and the two accounts as two
+    separate things: the Executive's own mailbox (its Google or Microsoft
+    account; the morning brief comes from it) and, optional, the owner's own
+    mailbox for Act as me. Home's banner slot then shows the getting-started
+    checklist (GettingStarted.tsx; rows from gettingStartedItems: profile,
+    first question, the two mailboxes read from /setup/status checks `gmail`
+    and `your_gmail`, and in team mode the roster) until every required row
+    is done or it is hidden (`oe.gettingStarted.hidden`); it outranks the
+    no-profile banner and the quiet-day note. The draft screen reuses
     the /company-profile section editors via
     components/company-profile/ProfileSections.tsx, extracted for this purpose:
     the sections already took onSave as an injected prop, so onboarding passes

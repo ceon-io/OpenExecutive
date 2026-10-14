@@ -8,6 +8,7 @@ import re
 import sqlite3
 import time
 import uuid
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any, Literal, NamedTuple
 
@@ -282,7 +283,11 @@ class _StreamStep(NamedTuple):
     """One step of the SSE driver loop.
 
     Exactly one of these is true: `item` holds a produced value, or `exhausted`
-    / `stopped` / `timed_out` says why nothing was produced.
+    / `stopped` / `timed_out` / `idle` says why nothing was produced.
+
+    `idle` means the keepalive interval passed with the step still running:
+    `pending` is that step, still in flight, for the caller to send a
+    keepalive and hand back to the next call. The caller owns cancelling it.
     """
 
     item: Any = None
@@ -290,6 +295,15 @@ class _StreamStep(NamedTuple):
     exhausted: bool = False
     stopped: bool = False
     timed_out: bool = False
+    idle: bool = False
+    pending: asyncio.Task[Any] | None = None
+
+
+# What the SSE stream sends while a turn is quiet: a comment line, which every
+# SSE reader (the web chat's included, which reads only `data:` lines) skips.
+# It keeps a browser or a proxy from dropping the connection as idle during a
+# slow tool call or specialist round.
+_SSE_KEEPALIVE = ": keepalive\n\n"
 
 
 async def _cancel_stream_step(anext_task: asyncio.Task[Any], turn_id: str) -> None:
@@ -328,8 +342,16 @@ async def _next_stream_step(
     stop_waiter: asyncio.Task[bool] | None,
     remaining: float,
     turn_id: str,
+    *,
+    keepalive_s: float = 0.0,
+    pending: asyncio.Task[Any] | None = None,
 ) -> _StreamStep:
     """Advance `stream` one step, racing the stop switch and the deadline.
+
+    With `keepalive_s`, it also returns `idle` once that long passes with the
+    step still running and the deadline not yet reached, leaving the step in
+    flight (`pending`); the caller sends a keepalive and passes it back as
+    `pending` to go on waiting on the same step.
 
     Extracted from the driver loop because the ordering here is load-bearing in
     several ways and is much easier to reason about — and to test — on its own.
@@ -347,13 +369,19 @@ async def _next_stream_step(
     # and like it this COPIES the current context, so the `set_turn` /
     # `set_session` bindings made in `event_generator` are inherited by every
     # step. See that function's comment for why that matters.
-    anext_task: asyncio.Task[Any] = asyncio.ensure_future(stream.__anext__())
+    anext_task: asyncio.Task[Any] = (
+        pending if pending is not None else asyncio.ensure_future(stream.__anext__())
+    )
+    # Whether the step is handed back still running (`idle`), the one exit
+    # that does not cancel it.
+    keep = False
+    wait_s = min(remaining, keepalive_s) if keepalive_s > 0 else remaining
     try:
         waiters: set[asyncio.Future[Any]] = {anext_task}
         if stop_waiter is not None:
             waiters.add(stop_waiter)
         await asyncio.wait(
-            waiters, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            waiters, timeout=wait_s, return_when=asyncio.FIRST_COMPLETED
         )
 
         if anext_task.done():
@@ -369,11 +397,15 @@ async def _next_stream_step(
 
         if stop_waiter is not None and stop_waiter.done():
             return _StreamStep(stopped=True)
+        if wait_s < remaining:
+            keep = True
+            return _StreamStep(idle=True, pending=anext_task)
         return _StreamStep(timed_out=True)
     finally:
-        # Every exit: stop, deadline, AND an outer cancellation from a client
-        # disconnect. Never leave the step running.
-        await _cancel_stream_step(anext_task, turn_id)
+        # Every exit but `idle`: stop, deadline, AND an outer cancellation
+        # from a client disconnect. Never leave the step running unowned.
+        if not keep:
+            await _cancel_stream_step(anext_task, turn_id)
 
 
 def _request_stop(client_turn_id: str, owner: str) -> str | None:
@@ -511,15 +543,53 @@ def _mail_private(session_id: str) -> bool:
         return True
 
 
+# Chat-app sessions held in a shared space (a channel, a group, a thread in
+# one), which others in it read anyway; the principal may open them as before.
+_SHARED_SESSION_PREFIXES = (
+    "slack:channel:", "slack:thread:",
+    "discord:channel:", "discord:thread:", "discord:msg:",
+    "telegram:-",
+)
+
+
+def _shared_space(session_id: str) -> bool:
+    """Whether ``session_id`` is a chat-app channel or group conversation
+    rather than someone's own chat. A Slack DM's channel id starts with "D",
+    so a thread in a DM is still that person's own."""
+    if not session_id.startswith(_SHARED_SESSION_PREFIXES):
+        return False
+    if session_id.startswith(("slack:channel:", "slack:thread:")):
+        return not session_id.split(":", 3)[2].startswith("D")
+    return True
+
+
+def _teammates_own(owner: int | None) -> bool:
+    """Whether a session ``owner`` is a team member other than the principal
+    (archived ones included: what they said stays theirs). Fails closed."""
+    if owner is None:
+        return False
+    from openexecutive.people.store import get_person
+
+    try:
+        person = get_person(int(owner))
+    except Exception:
+        logger.exception("chat: couldn't look up the owner of a session — treating it as theirs alone")
+        return True
+    return person is not None and person.kind == "team" and not person.is_principal
+
+
 def _session_access(
     request: Request, session_id: str, caller_person_id: int | None
 ) -> SessionAccess:
     """May this caller read, continue or delete ``session_id``?
 
-    The session's owner or the principal may (`is_principal_or_self`, the same
-    rule as feedback and followup; an ownerless legacy row is the principal's
-    alone). The one other way in is having started it in this process: that is
-    how an unresolved caller continues their own chat, whose row has no owner.
+    The session's owner may, and the principal may open any session that isn't
+    a teammate's (`is_principal_or_self`, the same rule as feedback and
+    followup; an ownerless legacy row is the principal's alone). A teammate's
+    own chat (the web app, a DM; not a channel or group, `_shared_space`) is
+    theirs alone, as their mail with the Executive is. The one
+    other way in is having started it in this process: that is how an
+    unresolved caller continues their own chat, whose row has no owner.
     A conversation that read its owner's own mail (Act as me,
     `session_store.mark_mail_private`) is its owner's alone: not the
     principal's, unless it is theirs. A check that can't be read refuses
@@ -542,6 +612,12 @@ def _session_access(
             return "allowed"
         if owner is None and _is_session_starter(request, session_id, caller_person_id):
             return "allowed"
+        return "forbidden"
+    if exists and owner is not None and caller_person_id == owner:
+        return "allowed"
+    if exists and not _shared_space(session_id) and _teammates_own(owner):
+        # A teammate's own chat with the Executive (the web app, a DM) is
+        # theirs alone, as their mail is: not the principal's either.
         return "forbidden"
     if exists and is_principal_or_self(caller_person_id, owner):
         return "allowed"
@@ -777,7 +853,10 @@ async def _run_chat_turn(
     from openexecutive.memory.episodic import format_for_prompt
     from openexecutive.memory.session_store import create_session
     from openexecutive.orchestrator.executive import Executive
-    from openexecutive.orchestrator.people_tools import is_principal_on_verified_surface
+    from openexecutive.orchestrator.people_tools import (
+        is_principal_on_verified_surface,
+        team_member_id,
+    )
 
     t0 = time.monotonic()
     # Same shape every other entry point mints (Executive.stream_chat), so
@@ -916,9 +995,14 @@ async def _run_chat_turn(
     # A conversation that once read the caller's own mail stays theirs: so
     # does what they say in it (the turn itself is pinned the same way).
     kept_private = _mail_private(session.session_id)
+    # A teammate's own chat is theirs too: every audit row of it, this one
+    # included, is theirs alone (`people_tools.teammate_turn_owner`).
+    own_rows = kept_private or (
+        not principal_turn and team_member_id(caller_person_id) is not None
+    )
     with (
         principal_turn_rows(principal_turn),
-        rows_for_person(caller_person_id) if kept_private else contextlib.nullcontext(),
+        rows_for_person(caller_person_id) if own_rows else contextlib.nullcontext(),
     ):
         audit_log(
             "chat_turn",
@@ -1064,7 +1148,7 @@ async def _run_chat_turn(
 
         with (
             principal_turn_rows(principal_turn),
-            rows_for_person(caller_person_id) if kept_private else contextlib.nullcontext(),
+            rows_for_person(caller_person_id) if own_rows else contextlib.nullcontext(),
             # The session isn't bound yet: recall the speaker's own documents.
             pinned_viewer(viewer_for_person(caller_person_id)),
         ):
@@ -1138,6 +1222,7 @@ async def _run_chat_turn(
             set_turn(session_id=session.session_id, turn_id=turn_id),
             set_session(session),
             principal_turn_rows(principal_turn),
+            rows_for_person(caller_person_id) if own_rows else contextlib.nullcontext(),
             bind_turn_files(turn_files),
         ):
             async with contextlib.aclosing(_sse_body()) as body:
@@ -1334,6 +1419,9 @@ async def _run_chat_turn(
                 if stop_event is not None
                 else None
             )
+            # A step left running across a keepalive (`_StreamStep.idle`).
+            # Every way out of the loop below cancels it in its `finally`.
+            pending: asyncio.Task[Any] | None = None
             try:
                 while True:
                     if stop_event is not None and stop_event.is_set():
@@ -1362,8 +1450,15 @@ async def _run_chat_turn(
                         break
 
                     step = await _next_stream_step(
-                        stream, stop_waiter, remaining, turn_id
+                        stream, stop_waiter, remaining, turn_id,
+                        keepalive_s=settings.chat_stream_keepalive_s,
+                        pending=pending,
                     )
+                    pending = step.pending
+
+                    if step.idle:
+                        yield _SSE_KEEPALIVE
+                        continue
 
                     if step.exhausted:
                         break
@@ -1411,6 +1506,10 @@ async def _run_chat_turn(
                         )
                     break
             finally:
+                if pending is not None:
+                    # Before the stream's `aclose` below, which raises on a
+                    # generator whose step is still running.
+                    await _cancel_stream_step(pending, turn_id)
                 if stop_waiter is not None:
                     # Otherwise: "Task was destroyed but it is pending".
                     stop_waiter.cancel()
@@ -1420,9 +1519,9 @@ async def _run_chat_turn(
             if inbox is not None:
                 inbox.close()
                 added_texts.extend(inbox.taken_texts())
-                # Audited like the turn's own "User:" row: private, and the
-                # caller's own, in a conversation that read their mail.
-                with rows_for_person(caller_person_id) if kept_private else contextlib.nullcontext():
+                # Audited like the turn's own "User:" row: the caller's own in
+                # a conversation that read their mail, or a teammate's chat.
+                with rows_for_person(caller_person_id) if own_rows else contextlib.nullcontext():
                     for added_text in added_texts:
                         audit_log(
                             "chat_turn",
@@ -1591,27 +1690,54 @@ class _StaysConnected(Request):
         return False
 
 
-async def _drain_background_turn(body: Any, session_id: str) -> None:
+def _is_error_event(event: Any) -> bool:
+    """Whether one SSE frame of a turn is its ``error`` event."""
+    if isinstance(event, bytes):
+        event = event.decode("utf-8", "replace")
+    if not isinstance(event, str) or not event.startswith("data: "):
+        return False
+    try:
+        payload = json.loads(event[len("data: "):])
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("type") == "error"
+
+
+async def _drain_background_turn(
+    body: Any, session_id: str, on_finished: Callable[[bool], None] | None = None,
+) -> None:
     """Run the turn's stream to its end. Its events have no reader; the turn
-    persists itself as it would for /chat."""
+    persists itself as it would for /chat. ``on_finished`` hears whether the
+    turn answered (False when it ended on an error event or raised)."""
+    answered = True
     try:
         async with contextlib.aclosing(body) as events:
-            async for _ in events:
-                pass
+            async for event in events:
+                if _is_error_event(event):
+                    answered = False
     except Exception:
+        answered = False
         logger.exception("chat.background_failed session_id=%s", session_id)
+    if on_finished is not None:
+        try:
+            on_finished(answered)
+        except Exception:
+            logger.exception("chat.background_on_finished_failed session_id=%s", session_id)
 
 
-@router.post("/chat/background", status_code=202, response_model=BackgroundChatResponse)
-async def chat_background(body: BackgroundChatRequest, request: Request) -> BackgroundChatResponse:
-    """Start a new chat and answer it on the server, to the end.
-
-    Unlike /chat, nobody needs to stay connected: a phone that approves a
-    card and closes the app still gets the work done, and the answer appears
-    in its chat list. Everything before the stream (who is calling, their
-    access, the session) is checked here as /chat checks it, so a refusal is
-    this request's error rather than a silent no-op later.
-    """
+async def start_background_turn(
+    request: Request,
+    *,
+    message: str,
+    memory_text: str | None = None,
+    on_finished: Callable[[bool], None] | None = None,
+) -> str:
+    """Start a new chat for the caller of ``request`` and answer it on the
+    server, to the end. Returns the new chat's session id. Raises 429 when the
+    caller already has as many running as they may, and any refusal of the
+    turn itself (who is calling, their access) as this call's error.
+    ``on_finished`` is called once the turn has ended, with whether it
+    answered."""
     owner = _stop_owner_key(request, _resolve_caller_person_id(request))
     # Claim the slot before the first await: the pre-stream work below takes
     # long enough for a burst of requests to all pass a check made earlier.
@@ -1626,17 +1752,19 @@ async def chat_background(body: BackgroundChatRequest, request: Request) -> Back
     session_id = str(uuid.uuid4())
     try:
         response = await _run_chat_turn(
-            message=body.message,
+            message=message,
             session_id=session_id,
             committee_review=False,
             attachment_blocks=None,
             request=_StaysConnected(request.scope, request.receive),
-            memory_text=body.memory_text,
+            memory_text=memory_text,
         )
     except BaseException:
         _release_background_slot(owner)
         raise
-    task = asyncio.create_task(_drain_background_turn(response.body_iterator, session_id))
+    task = asyncio.create_task(
+        _drain_background_turn(response.body_iterator, session_id, on_finished)
+    )
     _background_tasks.add(task)
 
     def _done(t: asyncio.Task[None]) -> None:
@@ -1645,6 +1773,22 @@ async def chat_background(body: BackgroundChatRequest, request: Request) -> Back
 
     task.add_done_callback(_done)
     logger.info("chat.background_started session_id=%s", session_id)
+    return session_id
+
+
+@router.post("/chat/background", status_code=202, response_model=BackgroundChatResponse)
+async def chat_background(body: BackgroundChatRequest, request: Request) -> BackgroundChatResponse:
+    """Start a new chat and answer it on the server, to the end.
+
+    Unlike /chat, nobody needs to stay connected: a phone that approves a
+    card and closes the app still gets the work done, and the answer appears
+    in its chat list. Everything before the stream (who is calling, their
+    access, the session) is checked here as /chat checks it, so a refusal is
+    this request's error rather than a silent no-op later.
+    """
+    session_id = await start_background_turn(
+        request, message=body.message, memory_text=body.memory_text,
+    )
     return BackgroundChatResponse(session_id=session_id)
 
 
@@ -1986,7 +2130,11 @@ async def _generate_prompts_via_llm(
     subtitle_raw = data.get("subtitle")
     if not isinstance(prompts_raw, list) or not isinstance(subtitle_raw, str):
         return None
-    prompts = [str(p).strip() for p in prompts_raw if isinstance(p, str) and p.strip()]
+    prompts = [
+        as_user_request(str(p).strip())
+        for p in prompts_raw
+        if isinstance(p, str) and p.strip()
+    ]
     subtitle = subtitle_raw.strip()
     if len(prompts) < 4 or not subtitle:
         return None
@@ -2011,6 +2159,13 @@ _FOLLOWUP_SYSTEM = (
     "or 'that'. Never repeat a question the user already asked. Never "
     "suggest looping in, messaging, or following up with the user "
     "themselves.\n\n"
+    "The suggestion is what the USER types, never the executive's own "
+    "words. When the last reply ends with an offer ('Should I draft a "
+    "follow-up to Andrew?', 'Want me to book it?'), the user accepts it "
+    "as a plain request: 'Draft a short follow-up to Andrew asking where "
+    "things stand.' Never copy the executive's offer, and never start "
+    "with 'Should I', 'Shall I', 'Want me to', 'Would you like me to' "
+    "or 'I can'.\n\n"
     "Output ONLY a JSON object with exactly one key — no prose, no "
     "markdown, no fences:\n"
     '  "suggestion": one sentence, 4-14 words, no greeting, no '
@@ -2047,7 +2202,96 @@ async def _generate_followup_via_llm(transcript: str) -> str | None:
     # A runaway or empty answer is worse than no suggestion in the composer.
     if not suggestion or len(suggestion.split()) > _FOLLOWUP_MAX_WORDS:
         return None
-    return suggestion
+    return as_user_request(suggestion, last_executive_reply=_last_executive_reply(transcript))
+
+
+def _last_executive_reply(transcript: str) -> str:
+    marker = "EXECUTIVE: "
+    i = transcript.rfind(marker)
+    return transcript[i + len(marker) :] if i >= 0 else ""
+
+
+# Openers that can only be the executive offering to do something. The
+# model sometimes copies the reply's closing offer into the composer as-is.
+_OFFER_OPENERS = re.compile(
+    r"^(?:(?:do you )?want me to|would you like me to|shall i)\s+",
+    re.IGNORECASE,
+)
+# "Should I …?" is also how a user asks for advice ("Should I raise
+# prices?"), so it is only an offer when the executive's reply made it.
+_SHOULD_I = re.compile(r"^should i\s+", re.IGNORECASE)
+# Executive-voice pronouns flip to the user's own once the offer is theirs:
+# "Want me to remind you?" -> "Remind me."
+_PRONOUN_FLIPS = {
+    "you": "me",
+    "your": "my",
+    "yours": "mine",
+    "yourself": "myself",
+    "you're": "I'm",
+    "you've": "I've",
+    "you'll": "I'll",
+    "you'd": "I'd",
+}
+_PRONOUN_RE = re.compile(
+    r"\b(" + "|".join(sorted(map(re.escape, _PRONOUN_FLIPS), key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+# "you" opening a clause is a subject: "check if you have time" needs "I",
+# not "me".
+_SUBJECT_YOU_RE = re.compile(
+    r"\b(if|when|whether|that|so|until|before|after|while)\s+you\b(?!')",
+    re.IGNORECASE,
+)
+# ...and so is "you" before a verb: "tell Sam you asked" -> "I asked". Not
+# after a verb that takes "you" as its object, where the next word is a bare
+# infinitive: "help you plan the offsite" -> "help me plan the offsite".
+_YOU_BEFORE_VERB_RE = re.compile(
+    r"\b(?:(\w+)\s+)?you(?=\s+(?:have|had|want|wanted|need|needed|asked|said|"
+    r"mentioned|can|could|will|would|should|might|plan|planned|think|thought)\b)",
+    re.IGNORECASE,
+)
+_OBJECT_YOU_VERBS = frozenset(
+    {"help", "let", "make", "have", "see", "watch", "hear", "bid", "get", "remind", "ask", "tell"}
+)
+
+
+def _subject_you(m: re.Match[str]) -> str:
+    before = m.group(1)
+    if before and before.lower() in _OBJECT_YOU_VERBS:
+        return m.group(0)
+    return (before + " " if before else "") + "I"
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"[^a-z0-9 ]", "", " ".join(text.lower().split()))
+
+
+def as_user_request(text: str, *, last_executive_reply: str = "") -> str:
+    """Turn an executive-voice offer into the user's own request.
+
+    "Should I draft a short follow-up to Andrew?" (copied from the reply)
+    becomes "Draft a short follow-up to Andrew." Anything that does not open
+    with an offer is returned unchanged.
+    """
+    rest: str | None = None
+    m = _OFFER_OPENERS.match(text)
+    if m:
+        rest = text[m.end() :]
+    else:
+        m = _SHOULD_I.match(text)
+        if m and _norm(text.rstrip("?")) in _norm(last_executive_reply):
+            rest = text[m.end() :]
+    if not rest:
+        return text
+    rest = _SUBJECT_YOU_RE.sub(lambda p: p.group(1) + " I", rest)
+    rest = _YOU_BEFORE_VERB_RE.sub(_subject_you, rest)
+    rest = _PRONOUN_RE.sub(lambda p: _PRONOUN_FLIPS[p.group(1).lower()], rest)
+    rest = rest.rstrip(" ?.!")
+    if not rest:
+        return text
+    return rest[0].upper() + rest[1:] + "."
 
 
 @router.get("/chat/suggested-prompts")

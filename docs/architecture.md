@@ -16,7 +16,7 @@ openexecutive/
 │   ├── core/                         # Python backend
 │   │   └── openexecutive/
 │   │       ├── orchestrator/         # Executive persona + routing loop
-│   │       ├── agents/               # 8 specialist agents + triage
+│   │       ├── agents/               # 9 specialist agents + triage
 │   │       ├── knowledge/            # ChromaDB store + RAG pipeline
 │   │       ├── memory/               # Company profile + episodic memory
 │   │       ├── onboarding/           # Conversational interview + commit; wizard fallback
@@ -504,6 +504,8 @@ Async Bolt app in socket mode, embedded in the FastAPI lifespan (no separate pro
 
 Required env vars: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`
 
+Or events over HTTP: with `SLACK_SIGNING_SECRET` set and no `SLACK_APP_TOKEN`, the same Bolt app takes Slack's Events API at `POST /webhook/slack` (`integrations/slack_events.py`). The route checks each request's signature (and refuses one older than five minutes) before Bolt or any listener sees it, answers Slack's URL check, and acknowledges at once. The app subscribes to `app_mention`, `message.im`, `message.channels` and `message.groups`, with the scopes `app_mentions:read`, `im:history`, `channels:history` and `groups:history`. In either mode a repeated event id is dropped (Slack resends an event it thinks went unacknowledged) and so is an event delivered for another workspace.
+
 Files a rostered sender shares (PDFs, Word, spreadsheets, text, images) are read into the turn — scanned PDFs converted to text — which needs the bot's **`files:read`** scope. Without it the message still gets a reply, but its files come back unreadable.
 
 A thread follow-up the response gate decides wasn't meant for the bot gets an :eyes: reaction, which needs the **`reactions:write`** scope. Without it the skip is still recorded in the audit log, just with no reaction.
@@ -572,8 +574,12 @@ All settings via environment variables (`.env` file in `packages/core/`).
 | `SCHEDULER_POLL_INTERVAL_SECONDS` | No | `30` | Scheduler poll frequency |
 | `SLACK_BOT_TOKEN` | No | — | Slack bot OAuth token |
 | `SLACK_APP_TOKEN` | No | — | Slack socket mode token |
+| `SLACK_SIGNING_SECRET` | No | — | Slack signing secret: hear Slack over HTTP at `/webhook/slack` instead of socket mode |
 | `EXEC_EMAIL_ADDRESS` | Yes | — | Executive Gmail address (Gmail MCP OAuth) |
 | `EMAIL_POLL_INTERVAL_SECONDS` | No | `60` | Email poll frequency |
+| `EMAIL_TURN_TIMEOUT_S` | No | `300` | Ceiling on the Executive's answer to one inbound email; past it the message is marked read and skipped |
+| `MCP_TOOL_TIMEOUT_S` | No | `120` | Ceiling on one MCP gateway call (Gmail, Calendar, Drive, Outlook, OneDrive) |
+| `CHAT_STREAM_KEEPALIVE_S` | No | `15` | Interval of the SSE keepalive comment on a quiet chat stream; 0 turns it off |
 | `TELEGRAM_BOT_TOKEN` | No | — | Telegram bot token |
 | `TELEGRAM_WEBHOOK_SECRET` | No | — | Must match the `secret_token` given to `setWebhook`; checked against `X-Telegram-Bot-Api-Secret-Token` |
 | `GOOGLE_CHAT_PROJECT_NUMBER` | No | — | GCP project number |

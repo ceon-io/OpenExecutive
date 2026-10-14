@@ -39,7 +39,7 @@ from openexecutive.memory.workspace_settings import (
     pin_turn_principal_role,
     pin_turn_workspace_mode,
 )
-from openexecutive.orchestrator import extensions, take_the_lead, tool_groups
+from openexecutive.orchestrator import department_gate, extensions, take_the_lead, tool_groups
 from openexecutive.orchestrator.action_chips import summarize_action
 from openexecutive.orchestrator.activity_labels import (
     fallback_activity,
@@ -105,6 +105,7 @@ from openexecutive.orchestrator.mcp_gateway import (
     MCP_TOOL_NAMES,
     MCP_TOOLS,
     MCPGateway,
+    gateway_reconnect_needed,
     gateway_server_names,
 )
 from openexecutive.orchestrator.open_loop_tools import (
@@ -143,6 +144,7 @@ from openexecutive.orchestrator.schedule_tools import (
 )
 from openexecutive.orchestrator.session import Session
 from openexecutive.orchestrator.skills_tools import SKILL_TOOL_HANDLERS, SKILL_TOOLS
+from openexecutive.orchestrator.teammate_mail import guard_call_tool
 from openexecutive.orchestrator.turn_inbox import (
     TurnInbox,
     render_added_messages,
@@ -1274,6 +1276,7 @@ class Executive:
             include_contacts=_contacts_in_prompt(session),
             delegation=block0_delegation_on(session),
             mcp_servers=gateway_server_names(self._mcp_gateway),
+            needs_reconnect=gateway_reconnect_needed(self._mcp_gateway),
             persona_instructions=persona_instructions,
         )
         # turn_id ties every downstream audit row (knowledge_retrieval,
@@ -1593,6 +1596,7 @@ class Executive:
             include_contacts=_contacts_in_prompt(session),
             delegation=block0_delegation_on(session),
             mcp_servers=gateway_server_names(self._mcp_gateway),
+            needs_reconnect=gateway_reconnect_needed(self._mcp_gateway),
             persona_instructions=persona_instructions,
         )
         # turn_id covers both the draft and (later) the revision pass so a
@@ -2101,6 +2105,13 @@ class Executive:
         leading = bool(unattended_withheld) and take_the_lead.executive_on()
         if leading:
             turn_handlers = take_the_lead.gated_handlers(turn_handlers, source="scheduled")
+        # A team member's turn (not the principal's): every send or edit goes
+        # through their department's authority first (department_gate), as
+        # unattended work goes through the scheduler's and Take the lead's.
+        seat = None if unattended_withheld else department_gate.speaker(current_session.get())
+        seat_session_id = getattr(current_session.get(), "session_id", None)
+        if seat is not None:
+            turn_handlers = department_gate.gated_handlers(turn_handlers, seat, session_id=seat_session_id)
         # Something new came in on a channel (mail, Slack, Telegram, …): with
         # Take the lead on, the reflection looks at it soon, batched.
         origin = str(getattr(current_session.get(), "origin_channel", "") or "")
@@ -2724,11 +2735,17 @@ class Executive:
                     )
 
             if mcp_tool_uses and self._mcp_gateway is not None:
+                # A teammate's mail with the Executive stays theirs: every
+                # mailbox read the model makes is filtered (teammate_mail).
                 _mcp_dispatch = {
                     "search_tools": self._mcp_gateway.search_tools,
-                    "call_tool": (
+                    "call_tool": guard_call_tool(
                         take_the_lead.gated_call_tool(self._mcp_gateway.call_tool, source="scheduled")
                         if leading
+                        else department_gate.gated_call_tool(
+                            self._mcp_gateway.call_tool, seat, session_id=seat_session_id,
+                        )
+                        if seat is not None
                         else self._mcp_gateway.call_tool
                     ),
                     "load_mcp_server": self._mcp_gateway.load_mcp_server,
@@ -2744,10 +2761,33 @@ class Executive:
                         logger.info("→ %s  input=%s", tu["name"], _log_value(tu["name"], tu["input"]))
                 # Same isolation as the skill gather above: a gateway crash on
                 # one tool must not take the turn down with it.
-                mcp_results = await asyncio.gather(
-                    *(_mcp_dispatch[tu["name"]](tu["input"]) for tu in mcp_tool_uses),
-                    return_exceptions=True,
-                )
+                try:
+                    mcp_results = await asyncio.gather(
+                        *(_mcp_dispatch[tu["name"]](tu["input"]) for tu in mcp_tool_uses),
+                        return_exceptions=True,
+                    )
+                except asyncio.CancelledError:
+                    # The turn was cut off (a deadline, a stop) with these
+                    # calls in flight. A request already sent may still run
+                    # on the server, a send included, so each gets its row,
+                    # as run_script's calls do.
+                    for tu in mcp_tool_uses:
+                        tool_label = tu["input"].get("name", tu["name"]) if tu["name"] == "call_tool" else tu["name"]
+                        audit_log(
+                            "tool_invocation",
+                            f"mcp:{tool_label} CANCELLED",
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            actor="executive",
+                            details={
+                                "tool": tool_label,
+                                "kind": "mcp",
+                                "iteration": iteration,
+                                "ok": False,
+                                "cancelled": True,
+                            },
+                        )
+                    raise
                 for tu, raw in zip(mcp_tool_uses, mcp_results, strict=True):
                     tool_label = tu["input"].get("name", tu["name"]) if tu["name"] == "call_tool" else tu["name"]
                     if isinstance(raw, BaseException):
@@ -2815,9 +2855,13 @@ class Executive:
                 # matters: the gateway's own gates (discovery, deny-list,
                 # recipients), Take the lead's gate on an unattended run, and
                 # the same chip and audit row, as each call happens.
-                script_call = (
+                script_call = guard_call_tool(
                     take_the_lead.gated_call_tool(self._mcp_gateway.call_tool, source="scheduled")
                     if leading
+                    else department_gate.gated_call_tool(
+                        self._mcp_gateway.call_tool, seat, session_id=seat_session_id,
+                    )
+                    if seat is not None
                     else self._mcp_gateway.call_tool
                 )
                 # The Executive's own tools a script may call this turn: the

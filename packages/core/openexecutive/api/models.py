@@ -170,6 +170,23 @@ class SyncedDocContent(BaseModel):
     content: str
 
 
+class GatewayHealth(BaseModel):
+    """The MCP gateway (orchestrator/gateway_boot.py): ``off`` (MCP not
+    enabled), ``no_servers`` (enabled, config names none), ``starting`` (an
+    attempt is running), ``up``, or ``down`` (every attempt failed so far;
+    ``next_retry_at`` says when the next one is). ``attempts`` counts starts
+    tried. The failure's text stays in the log and the owner's Setup notice:
+    the route is open to anyone. ``email_poller`` is whether the poller that
+    rides on the gateway runs."""
+
+    state: str
+    attempts: int = 0
+    last_failed_at: str | None = None
+    up_since: str | None = None
+    next_retry_at: str | None = None
+    email_poller: bool = False
+
+
 class HealthResponse(BaseModel):
     status: str
     builtin_knowledge_chunks: int
@@ -183,7 +200,11 @@ class HealthResponse(BaseModel):
     # Setup status says which. A non-empty list means a workspace-mcp rename or
     # a tool the configured services and tier never loaded.
     google_tools_missing: list[str] | None = None
-    version: str = "0.5.4"  # x-release-please-version
+    # The MCP gateway's state (``GatewayHealth``). A hosted instance whose
+    # gateway failed to start used to look healthy here while no email went
+    # out or came in.
+    gateway: GatewayHealth | None = None
+    version: str = "0.5.5"  # x-release-please-version
 
 
 class VersionResponse(BaseModel):
@@ -261,6 +282,9 @@ class SessionSummary(BaseModel):
     # words (0 when only the title does) and the newest one around the match.
     match_count: int | None = None
     snippet: str | None = None
+    # Set on the plain list: the chat's last message as one line, "You: "
+    # before the person's own words, for a list that says what each chat is.
+    preview: str | None = None
 
 
 class TargetCustomerData(BaseModel):

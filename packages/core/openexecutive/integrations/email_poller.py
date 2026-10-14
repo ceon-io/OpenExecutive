@@ -16,6 +16,7 @@ live in `workspace/google.py` and `workspace/microsoft.py`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -48,6 +49,14 @@ POLL_INTERVAL_SECONDS = get_settings().email_poll_interval_seconds
 
 # Prevents reprocessing the same message within a run (cleared on restart).
 _processed_ids: set[str] = set()
+# Failed attempts per message this run. A message whose handling keeps
+# raising (a fetch that always fails, a bug its content trips) is given up
+# after _MAX_ATTEMPTS rather than retried every poll for the life of the
+# process, each attempt holding the queue behind it.
+_failed_attempts: dict[str, int] = {}
+_MAX_ATTEMPTS = 3
+# What a settings stub without `email_turn_timeout_s` gets (config's default).
+_DEFAULT_TURN_TIMEOUT_S = 300.0
 
 _SKIP_SENDERS = ("noreply", "no-reply", "mailer-daemon", "postmaster", "do-not-reply")
 
@@ -56,6 +65,20 @@ def _mail_provider() -> MailProvider:
     """The configured mail backend, resolved through this module's `get_settings`
     (tests patch it with a stub; a stub without `email_provider` → google)."""
     return get_mail_provider(get_settings())
+
+
+class EmailTurnTimeout(Exception):
+    """The Executive's turn for one email ran past ``EMAIL_TURN_TIMEOUT_S``."""
+
+    def __init__(self, timeout_s: float) -> None:
+        super().__init__(f"email turn ran past {timeout_s:.0f}s")
+        self.timeout_s = timeout_s
+
+
+def _turn_timeout_s() -> float:
+    """``EMAIL_TURN_TIMEOUT_S``, through this module's `get_settings` (tests
+    patch it with a stub that may not carry it)."""
+    return float(getattr(get_settings(), "email_turn_timeout_s", _DEFAULT_TURN_TIMEOUT_S))
 
 
 # Section markers in the rendered inbound text (`workspace.mail.render_for_
@@ -362,8 +385,25 @@ async def poll_once(gateway: MCPGateway, provider: MailProvider | None = None) -
         try:
             await _handle_email(gateway, mid, ref.thread_id, user_email, provider=provider)
             _processed_ids.add(mid)
+            _failed_attempts.pop(mid, None)
         except Exception:
-            logger.exception("failed for message=%s", mid)
+            attempts = _failed_attempts.get(mid, 0) + 1
+            if attempts < _MAX_ATTEMPTS:
+                _failed_attempts[mid] = attempts
+                logger.exception("failed for message=%s (attempt %d of %d)", mid, attempts, _MAX_ATTEMPTS)
+                continue
+            logger.exception(
+                "failed for message=%s %d times — giving up on it; it is marked read",
+                mid, attempts,
+            )
+            _failed_attempts.pop(mid, None)
+            _processed_ids.add(mid)
+            # Marked read so a restart doesn't start the same failure over.
+            # The principal still finds it in the inbox, read.
+            try:
+                await _mark_read(gateway, mid, user_email, provider=provider)
+            except Exception:
+                logger.warning("could not mark message=%s read", mid, exc_info=True)
 
 
 async def _handle_email(
@@ -459,7 +499,7 @@ async def _handle_one_email(
     # in _run_executive) so it knows reply tools will block and proposes
     # to a human instead.
     from openexecutive.audit import log_event as audit_log
-    from openexecutive.audit import private_rows
+    from openexecutive.audit import private_rows, rows_for_person
     from openexecutive.people.identity import resolve_email_sender
     sender_in_roster = resolve_email_sender(from_addr) is not None
     # Mail from one of the principal's contacts, or mail they forwarded: its
@@ -478,9 +518,33 @@ async def _handle_one_email(
     # is, however early it is written: the knowledge retrieval, for one,
     # runs before the turn binds its private session. The scope ends with
     # the handling.
+    # Mail from a teammate, Gmail-authenticated as theirs, is their own turn:
+    # every row of it is theirs alone, as their mail is
+    # (`people_tools.teammate_turn_owner`). An unauthenticated one stays
+    # where the principal reads it, so a forged From can't hide a turn.
+    teammate_authenticated: bool | None = None
+    teammate_id: int | None = None
+    # Only Gmail authenticates a sender (`fact_confirmation.read_raw`).
+    if not private and sender_in_roster and provider.name == "google":
+        from openexecutive.integrations.fact_confirmation import sender_authenticated
+        from openexecutive.orchestrator.people_tools import team_member_id
+
+        try:
+            sender = resolve_email_sender(from_addr)
+            teammate_id = team_member_id(sender.id if sender is not None else None)
+            if teammate_id is not None:
+                teammate_authenticated = await sender_authenticated(gateway, message_id, from_addr)
+        except Exception:  # noqa: BLE001 - optional step; must not lose the email.
+            logger.warning("sender check failed; this mail's audit rows follow the ordinary rule", exc_info=True)
+            teammate_authenticated = None
+        if teammate_authenticated is not True:
+            teammate_id = None
     held_for_roster = False
     roster_acknowledged = False
-    with private_rows(private):
+    with (
+        private_rows(private),
+        rows_for_person(teammate_id) if teammate_id is not None else contextlib.nullcontext(),
+    ):
         if not sender_in_roster:
             # A contact, like any non-team sender, gets no reply from this turn
             # (the gateway reaches contacts only when the principal asks
@@ -516,10 +580,10 @@ async def _handle_one_email(
         # `message` is what the sender wrote (quoted replies and a forwarded
         # message cut off, as peer memory sees it), the same thing web chat
         # keeps for a turn. The quoted chain below it is other people's mail
-        # — a contact's, on the principal's reply to one — and every
-        # signed-in user reads this row unless it is private, so the whole
-        # body is kept only on a private row, which the principal alone
-        # reads. Each field is cut, by its escaped JSON length, well under the
+        # — a contact's, on the principal's reply to one — and the
+        # principal reads this row unless it is private to them or to a
+        # teammate, so the whole body is kept only on a row private to the
+        # principal. Each field is cut, by its escaped JSON length, well under the
         # logger's 64 KB cap so an oversized mail loses its tail, not the
         # row's structure.
         body = "\n".join(body_lines).strip()
@@ -562,6 +626,32 @@ async def _handle_one_email(
                 roster_acknowledged=roster_acknowledged,
                 reply_block=reply_block,
                 provider=provider,
+                teammate_authenticated=teammate_authenticated,
+            )
+        except EmailTurnTimeout as exc:
+            # Past EMAIL_TURN_TIMEOUT_S: the turn was cancelled where it
+            # stood. It is not run again, as with any turn that raised: it
+            # may already have replied, and running it again could reply
+            # twice. Marked read below, so the next message goes ahead.
+            timeout_s = exc.timeout_s
+            logger.error(
+                "Executive turn for message=%s ran past %.0fs — cut off; the message is marked read",
+                message_id, timeout_s,
+            )
+            audit_log(
+                "integration_inbound",
+                f"Answer to email from {from_addr} cut off after {timeout_s:.0f}s; "
+                "a reply may already have gone",
+                actor="email",
+                session_id=session_id,
+                details={
+                    "channel": "email",
+                    "message_id": message_id,
+                    "from": from_addr,
+                    "outcome": "turn_timeout",
+                    "timeout_s": timeout_s,
+                },
+                private=private,
             )
         except Exception:
             logger.exception("Executive raised for message=%s", message_id)
@@ -756,6 +846,7 @@ async def _run_executive(
     roster_acknowledged: bool = False,
     reply_block: str = "",
     provider: MailProvider | None = None,
+    teammate_authenticated: bool | None = None,
 ) -> None:
     from openexecutive.knowledge.retriever import retrieve
     from openexecutive.memory.episodic import format_for_prompt
@@ -774,6 +865,11 @@ async def _run_executive(
     # through the decision extractor as the principal's own words
     # (`content_trust.principal_speaking`).
     session = Session(**session_kwargs, origin_channel="email")
+    # The email this turn answers is one it may read, reply in or quote,
+    # whoever sent it (orchestrator.teammate_mail).
+    from openexecutive.orchestrator.teammate_mail import allow_mail_ids
+
+    allow_mail_ids(session, message_id, thread_id)
     if from_addr:
         # Who the mail claims to be from, and whether Gmail authenticated it:
         # the fact tools let the principal's own authenticated mail ask for a
@@ -794,6 +890,22 @@ async def _run_executive(
         session.email_authenticated = bool(principal) and session.email_from == principal and (
             await sender_authenticated(gateway, message_id, from_addr)
         )
+        if not session.email_authenticated:
+            # A teammate's own mail is theirs to read back only when Gmail
+            # vouches the email is from them (orchestrator.teammate_mail).
+            from openexecutive.people.identity import resolve_email_sender
+
+            try:
+                sender = resolve_email_sender(from_addr)
+                if teammate_authenticated is not None:
+                    # Already checked while the mail was handled.
+                    session.email_sender_authenticated = teammate_authenticated
+                elif sender is not None and not sender.is_principal:
+                    session.email_sender_authenticated = await sender_authenticated(
+                        gateway, message_id, from_addr
+                    )
+            except Exception:  # noqa: BLE001 - optional step; must not lose the email.
+                logger.warning("sender check failed; teammate mail stays private this turn", exc_info=True)
     if from_addr:
         # Only register the sender as a schedulable channel_ref if they
         # are in the People roster. Without this guard, an attacker who
@@ -957,17 +1069,30 @@ async def _run_executive(
     # deeper Honcho prefetch) is a per-request opt-in on /chat only; it
     # was previously forced on here for every inbound email, including
     # off-roster senders the gateway will not let us reply to anyway.
-    await executive.chat(
-        user_message=base_message,
-        session=session,
-        retrieved_context=retrieve(query=raw_email[:500]),
-        episodic_context=format_for_prompt(),
-        person_id=person_id,
-        co_present_person_ids=co_present_person_ids or None,
-        # Only the sender's own words reach peer memory — see _email_memory_text.
-        # An unrostered sender has no peer to record into, so skip the parse.
-        memory_text=_email_memory_text(raw_email) if person_id is not None else None,
-    )
+    #
+    # The poller handles one message at a time, so the turn has a ceiling
+    # (EMAIL_TURN_TIMEOUT_S): past it the turn is cancelled and
+    # EmailTurnTimeout reaches the caller, rather than one slow turn holding
+    # every message behind it. Any other TimeoutError from inside the turn
+    # passes through as it is.
+    timeout_s = _turn_timeout_s()
+    try:
+        async with asyncio.timeout(timeout_s) as deadline:
+            await executive.chat(
+                user_message=base_message,
+                session=session,
+                retrieved_context=retrieve(query=raw_email[:500]),
+                episodic_context=format_for_prompt(),
+                person_id=person_id,
+                co_present_person_ids=co_present_person_ids or None,
+                # Only the sender's own words reach peer memory — see _email_memory_text.
+                # An unrostered sender has no peer to record into, so skip the parse.
+                memory_text=_email_memory_text(raw_email) if person_id is not None else None,
+            )
+    except TimeoutError as exc:
+        if deadline.expired():
+            raise EmailTurnTimeout(timeout_s) from exc
+        raise
 
 
 async def _mark_read(

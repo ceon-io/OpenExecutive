@@ -320,6 +320,12 @@ class Settings(BaseSettings):
         Literal["none", "minimal", "low", "medium", "high"] | None
     ) = Field(None, alias="LOCAL_REASONING_EFFORT")
 
+    # The model that scores eval answers (`make eval` and the Evals page).
+    # Unset = Claude Opus. Any slug the registry routes works, so a slug in
+    # LOCAL_MODELS runs the judge on the local server too, for a run with no
+    # hosted API at all.
+    eval_judge_model: str | None = Field(None, alias="EVAL_JUDGE_MODEL")
+
     @field_validator("local_models", mode="before")
     @classmethod
     def _parse_local_models(cls, v: Any) -> list[str]:
@@ -424,6 +430,12 @@ class Settings(BaseSettings):
     # typically 5–12s.
     committee_extra_timeout_s: float = Field(60.0, alias="COMMITTEE_EXTRA_TIMEOUT_S")
 
+    # How often a streaming chat turn sends an SSE comment while nothing else
+    # is going out (a slow tool call, a long specialist round). Browsers and
+    # proxies drop an idle stream, often after 30-60s, well inside the
+    # whole-turn deadline above. 0 turns it off.
+    chat_stream_keepalive_s: float = Field(15.0, alias="CHAT_STREAM_KEEPALIVE_S", ge=0)
+
     # Per-call ceiling for the onboarding interview. It used to borrow
     # chat_stream_timeout_s, which meant raising that to 300s would have let the
     # wizard's 2-attempt retry loop hang for up to 600s before surfacing
@@ -456,6 +468,9 @@ class Settings(BaseSettings):
 
     slack_bot_token: str | None = Field(None, alias="SLACK_BOT_TOKEN")
     slack_app_token: str | None = Field(None, alias="SLACK_APP_TOKEN")
+    # The other way to hear Slack: with this set and no SLACK_APP_TOKEN, Slack
+    # posts events to POST /webhook/slack, signed with the app's signing secret.
+    slack_signing_secret: str | None = Field(None, alias="SLACK_SIGNING_SECRET")
     # Company-wide broadcast channels — when set, OE can post to "the
     # whole team" on a given integration without picking a specific
     # human or department. Used by `send_company_broadcast`. Each is
@@ -481,7 +496,29 @@ class Settings(BaseSettings):
     # identity addendum so the model has a concrete self-name and never
     # falls back to signing as a person from the company People roster.
     exec_display_name: str = Field("Open Executive", alias="EXEC_DISPLAY_NAME")
+    # AI disclosure (orchestrator.disclosure): a line on the mail and chat
+    # messages the Executive sends saying it is an AI assistant. On unless
+    # turned off. The texts replace the built-in wording; one that doesn't
+    # say "AI" is ignored, so the line can't be reworded into hiding it.
+    ai_disclosure: bool = Field(True, alias="AI_DISCLOSURE")
+    ai_disclosure_mail_text: str = Field("", alias="AI_DISCLOSURE_MAIL_TEXT", max_length=500)
+    ai_disclosure_chat_text: str = Field("", alias="AI_DISCLOSURE_CHAT_TEXT", max_length=200)
+    # Where each person's own switches start (delegation.disclosure): a line
+    # on the replies Handle it for me sends as them on its own, and on the
+    # drafts they approve and send themselves. Each person can change theirs.
+    ai_disclosure_handle_it: bool = Field(True, alias="AI_DISCLOSURE_HANDLE_IT")
+    ai_disclosure_approved_sends: bool = Field(False, alias="AI_DISCLOSURE_APPROVED_SENDS")
     email_poll_interval_seconds: int = Field(60, alias="EMAIL_POLL_INTERVAL_SECONDS")
+    # Whole-turn ceiling for the Executive's answer to one inbound email. The
+    # poller handles mail one message at a time, so a turn with no ceiling held
+    # every message behind it. A timed-out message is marked read and not tried
+    # again: the turn may already have replied.
+    email_turn_timeout_s: float = Field(300.0, alias="EMAIL_TURN_TIMEOUT_S", gt=0)
+    # Ceiling on one call through the MCP gateway (Gmail, Calendar, Drive,
+    # Outlook, OneDrive, tool search). A call past it is abandoned and reported
+    # as not answered, so a hung workspace server can't hold a turn, a brief or
+    # the email poller.
+    mcp_tool_timeout_s: float = Field(120.0, alias="MCP_TOOL_TIMEOUT_S", gt=0)
 
     # Which Google services the co-located workspace-mcp child loads, and at
     # which tier. These are the same two variables `docker/workspace-mcp-launch.sh`
@@ -624,7 +661,7 @@ class Settings(BaseSettings):
     google_chat_project_number: str | None = Field(None, alias="GOOGLE_CHAT_PROJECT_NUMBER")
 
     @field_validator(
-        "slack_bot_token", "slack_app_token", "telegram_bot_token",
+        "slack_bot_token", "slack_app_token", "slack_signing_secret", "telegram_bot_token",
         "discord_bot_token", "discord_app_id", "google_chat_project_number",
         "google_chat_service_account_file", "google_chat_service_account_email",
         mode="before",

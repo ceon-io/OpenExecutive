@@ -99,6 +99,7 @@ EVENT_TYPES: tuple[str, ...] = (
     "delegation_actions_handled",   # a card of actions they allowed was carried out on its own (in training)
     "delegation_actions_held",      # a card of allowed actions waited for them after all; details.reason says why
     "delegation_training_changed",  # a person put Act as me settings in or out of training (PUT /delegation/training)
+    "delegation_disclosure_changed",  # a person changed the AI line on replies sent as them (PUT /delegation/disclosure)
     "fact_retired",                 # the principal (or the teammate who recorded it) retired a standing fact from the Pulse page (memory/facts.py)
     "fact_reviewed",                # the principal approved or declined a teammate's proposed standing fact
     "fact_approval_changed",        # the principal turned "needs my approval" on or off for a teammate's standing facts
@@ -201,8 +202,19 @@ def _row_to_event(row: sqlite3.Row) -> AuditEvent:
     )
 
 
-def _owner_clause(owned_by: int | None, params: list[Any]) -> str:
-    """Leave out every team member's own rows but ``owned_by``'s."""
+def _owner_clause(
+    owned_by: int | None, params: list[Any], only_owned: bool = False, all_owners: bool = False
+) -> str:
+    """Leave out every team member's own rows but ``owned_by``'s — and, when
+    ``only_owned``, every row that is not theirs. ``all_owners`` keeps every
+    member's rows (the read API shows the principal their actions, redacted)."""
+    if all_owners:
+        return "1"
+    if only_owned:
+        if owned_by is None:
+            return "0"
+        params.append(int(owned_by))
+        return "private_to_person = ?"
     if owned_by is None:
         return "private_to_person IS NULL"
     params.append(int(owned_by))
@@ -504,17 +516,20 @@ class AuditLogger:
         department: str | None = None,
         include_private: bool = True,
         owned_by: int | None = None,
+        only_owned: bool = False,
+        all_owners: bool = False,
     ) -> list[AuditEvent]:
         """Rows matching every filter given, newest first. ``include_private``
         False leaves out the rows private to the principal — filtered in SQL,
         so a page is still full and ``count`` agrees with it. A team member's
-        own rows are left out unless ``owned_by`` is them."""
+        own rows are left out unless ``owned_by`` is them; ``only_owned``
+        keeps ``owned_by``'s own rows alone (none with no ``owned_by``)."""
         limit = max(1, min(limit, 1000))
         offset = max(0, offset)
 
         clauses: list[str] = []
         params: list[Any] = []
-        clauses.append(_owner_clause(owned_by, params))
+        clauses.append(_owner_clause(owned_by, params, only_owned, all_owners))
         if not include_private:
             clauses.append("private_to_principal = 0")
         if event_type:
@@ -567,10 +582,12 @@ class AuditLogger:
         until: str | None = None,
         include_private: bool = True,
         owned_by: int | None = None,
+        only_owned: bool = False,
+        all_owners: bool = False,
     ) -> int:
         clauses: list[str] = []
         params: list[Any] = []
-        clauses.append(_owner_clause(owned_by, params))
+        clauses.append(_owner_clause(owned_by, params, only_owned, all_owners))
         if not include_private:
             clauses.append("private_to_principal = 0")
         if event_type:

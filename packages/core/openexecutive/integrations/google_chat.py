@@ -269,18 +269,29 @@ async def _process_and_reply(
         },
     )
 
+    # The sender's People row, by the Google account email on the event (the
+    # JWT proves the event is Google's, so the email is Google's word). None
+    # for someone who isn't on People; the department gate then holds their
+    # sends and edits for approval.
+    sender_person = None
+    if sender_email:
+        try:
+            from openexecutive.people.store import find_person_by_email
+
+            sender_person = find_person_by_email(sender_email)
+        except Exception:
+            logger.exception("Google Chat: failed to look up the sender on People")
+
     # Fork into alert triage pipeline (fire-and-forget, same pattern as Slack/email).
     try:
-        from openexecutive.alerts.models import AlertEvent
-        from openexecutive.alerts.pipeline import schedule_evaluation
+        from openexecutive.alerts.pipeline import schedule_chat_message_evaluation
 
-        schedule_evaluation(
-            AlertEvent(
-                source="google_chat",
-                external_id=message_name,
-                body=message_text,
-                user=sender_name,
-            )
+        schedule_chat_message_evaluation(
+            source="google_chat",
+            external_id=message_name,
+            body=message_text,
+            sender=sender_person,
+            fallback_name=sender_name,
         )
     except Exception:
         logger.exception("Google Chat: failed to schedule alert evaluation")
@@ -301,11 +312,15 @@ async def _process_and_reply(
             session_id=session_id,
             company_profile=profile if not profile.is_empty() else None,
             # Names the surface for logging and the `<channel>` block. This
-            # adapter has no roster gate (the webhook authenticates Google,
-            # not the sender) and never populates trusted_alert_ids, so
+            # adapter turns no sender away (anyone in a space can post) and
+            # never populates trusted_alert_ids, so
             # `ack_alert` refuses here — matching what the channel block
             # already tells the model about this surface.
             origin_channel="google_chat",
+            # The sender's People row, for the department gate alone: this
+            # surface isn't one `people_tools` verifies, so it is never
+            # `caller_person_id` and grants nothing else.
+            gate_sender_person_id=sender_person.id if sender_person else None,
         )
         retrieved_context = retrieve(query=message_text, max_chars=get_settings().knowledge_chat_max_chars)
         episodic_context = format_for_prompt()
@@ -334,8 +349,11 @@ async def _process_and_reply(
             channel_context_block=build_channel_context_block("google_chat"),
             attachment_blocks=image_blocks or None,
         )
+        from openexecutive.orchestrator.disclosure import with_chat_line
+
         await asyncio.to_thread(
-            send_reply, space_name, thread_name, response, service_account_file, service_account_email
+            send_reply, space_name, thread_name, with_chat_line(response, session_id),
+            service_account_file, service_account_email,
         )
     except Exception:
         logger.exception("Google Chat: handler error for message %s", message_name)

@@ -1,5 +1,7 @@
+import type { AlertApproval } from "@/lib/approvals";
 import type { AnswerSources } from "@/lib/answerSources";
 import type { HistoryNote, HistoryState } from "@/lib/history";
+import type { NotificationSettings, NotificationSettingsUpdate } from "@/lib/notifications";
 import type { SetupStatus } from "@/lib/setupStatus";
 
 const API_BASE = "/api/backend";
@@ -583,6 +585,8 @@ export interface SyncedDoc {
   modified_at: string | null;
   synced_at: string | null;
   indexed: boolean;
+  /** Why a file has no readable text, when the sync knows (Drive only). */
+  unreadable_reason?: string | null;
 }
 
 export interface SyncedDocList {
@@ -1534,6 +1538,8 @@ export interface DelegationSettings {
   handle_it?: HandleIt | null;
   // Absent (or null) on a backend that predates per-setting training.
   training?: Training | null;
+  // Absent (or null) on a backend that predates the AI line on replies.
+  disclosure?: ReplyDisclosure | null;
   // The owner's "Let team members use Act as me", while the install allows
   // it; null (or absent) for everyone else.
   team?: DelegationTeam | null;
@@ -1600,6 +1606,16 @@ export interface Training {
   actions: boolean;
   drafts: boolean;
   learned: TrainingLearned[];
+}
+
+// The AI line on replies sent as you (delegation/disclosure.py): on replies
+// Handle it for me sends on its own, and on drafts you send. `enabled` is the
+// install's AI_DISCLOSURE; when it's off neither line is added.
+export interface ReplyDisclosure {
+  enabled: boolean;
+  handle_it: boolean;
+  approved_sends: boolean;
+  line: string;
 }
 
 export interface HandleIt {
@@ -1734,6 +1750,40 @@ export async function getDelegation(signal?: AbortSignal): Promise<DelegationSet
 }
 
 // ---------------------------------------------------------------------------
+// Settings → Notifications: the caller's own quiet hours, digest or instant,
+// and urgent things through (/notifications/settings).
+// ---------------------------------------------------------------------------
+
+export type {
+  Delivery,
+  NotificationSettings,
+  NotificationSettingsUpdate,
+  QuietDays,
+  QuietHours,
+} from "@/lib/notifications";
+
+// null when this viewer has none to set (403: not signed in or not on the
+// People list) or the backend predates it (404).
+export async function getNotificationSettings(signal?: AbortSignal): Promise<NotificationSettings | null> {
+  const res = await fetch(`${API_BASE}/notifications/settings`, { signal });
+  if (res.status === 403 || res.status === 404) return null;
+  if (!res.ok) throw await delegationError(res, "Couldn't load your notification settings.");
+  return res.json();
+}
+
+export async function updateNotificationSettings(
+  update: NotificationSettingsUpdate,
+): Promise<NotificationSettings> {
+  const res = await fetch(`${API_BASE}/notifications/settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
+  if (!res.ok) throw await delegationError(res, "Couldn't save your notification settings.");
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
 // Always in the loop: the caller's own notes (/memories/history). Each person
 // sees and changes only their own; the company retention is the owner's.
 // ---------------------------------------------------------------------------
@@ -1853,6 +1903,19 @@ export async function setTraining(update: Partial<Record<TrainingSetting, boolea
   });
   if (!res.ok) throw await delegationError(res, "Couldn't change training.");
   return (await res.json()) as DelegationSettings;
+}
+
+export async function setReplyDisclosure(update: {
+  handle_it?: boolean;
+  approved_sends?: boolean;
+}): Promise<DelegationSettings> {
+  const res = await fetch(`${API_BASE}/delegation/disclosure`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
+  if (!res.ok) throw await delegationError(res, "Couldn't change the AI line on your replies.");
+  return res.json();
 }
 
 export async function setHandleIt(update: {
@@ -2543,6 +2606,8 @@ export interface WorkflowRunDetail extends WorkflowRunSummary {
   state_json?: string | null;
   resolution_json?: string | null;
   resume_progress?: ResumeProgress | null;
+  // A failed scheduled run that Run again can queue.
+  rerunnable?: boolean;
 }
 
 /** The serialized gate in `state_json`, for rendering what a paused run is
@@ -3722,7 +3787,14 @@ export async function listDepartments(): Promise<DepartmentState[]> {
   return res.json();
 }
 
-export async function getDepartment(slug: string): Promise<DepartmentState> {
+/** One department as its page reads it (GET and PATCH /departments/{slug}). */
+export interface DepartmentDetail extends DepartmentState {
+  /** When the next check-in is queued (ISO, UTC); null when the check-in is
+   *  off, the workspace is solo, or none is queued yet. */
+  next_check_in_at: string | null;
+}
+
+export async function getDepartment(slug: string): Promise<DepartmentDetail> {
   const res = await fetch(`${API_BASE}/departments/${slug}`);
   if (!res.ok) throw new Error(`Failed to load department: ${res.statusText}`);
   return res.json();
@@ -3742,7 +3814,7 @@ export interface DepartmentPatch {
   watched_entities?: string[];
 }
 
-export async function updateDepartment(slug: string, patch: DepartmentPatch): Promise<DepartmentState> {
+export async function updateDepartment(slug: string, patch: DepartmentPatch): Promise<DepartmentDetail> {
   const res = await fetch(`${API_BASE}/departments/${slug}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -4226,6 +4298,8 @@ export interface ProposalItem {
   // /decisions endpoints (which book/cancel server-side) instead of the
   // ack-and-handoff-to-chat flow. Null/absent for ordinary alert proposals.
   decision_instance_id?: number | null;
+  // A scheduled run that failed: the run its Run again queues once more.
+  failed_run_id?: string | null;
   // Set when the card is a roster request ("who is this new sender?"): the
   // briefing answers it at /people/requests/{id} instead of ack-and-chat.
   roster_request?: RosterRequestCard | null;
@@ -4257,6 +4331,15 @@ export interface ProposalItem {
 
 // One autonomous alert-review move since the last delivered morning brief
 // (routed / nudged / escalated / drafted / merged / closed / changed).
+// One brief's held-back lines: what it named that couldn't be matched to
+// your data. The brief's note points here ("Left out of your brief").
+export interface HeldBackItem {
+  event_id: number;
+  surface: string;
+  at: string;
+  lines: string[];
+}
+
 export interface HandledItem {
   kind: string;
   summary: string;
@@ -4308,6 +4391,9 @@ export interface Today {
   // Optional for older API builds + test mocks.
   narrative_generated_at?: string | null;
   narrative_stale?: boolean;
+  // The install's first week: the brief opens with getting-started moves,
+  // so the page doesn't call the day quiet. Optional for older API builds.
+  first_week?: boolean;
   // In-flight commitments (pending follow-ups/nudges) + people we're awaiting
   // a reply from. Optional/default-empty for older API builds + test mocks.
   in_flight?: InFlightItem[];
@@ -4323,6 +4409,8 @@ export interface Today {
   // What the Executive's alert review did on its own since the last morning
   // brief — the "handled overnight" rail with Undo. Optional/default-empty.
   handled_overnight?: HandledItem[];
+  // Lines grounding left out of your briefs in the last day (principal only).
+  held_back?: HeldBackItem[];
 }
 
 export async function getToday(): Promise<Today> {
@@ -4425,6 +4513,29 @@ export async function bulkAckAlerts(body: {
   });
   if (!res.ok) throw new Error(`Failed to bulk-ack alerts: ${res.statusText}`);
   return res.json();
+}
+
+// Hide a card from Home until `until`; it comes back on its own then.
+// `null` brings it back now (the Undo).
+export async function snoozeAlert(alertId: number, until: Date | null): Promise<void> {
+  const res = await fetch(`${API_BASE}/alerts/${alertId}/snooze`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ until: until ? until.toISOString() : null }),
+  });
+  if (!res.ok) throw new Error(`Failed to snooze alert ${alertId}: ${res.status} ${res.statusText}`);
+}
+
+// Run a failed scheduled run again (a check-in, a saved workflow on a
+// cadence). It is queued now and delivers the way the scheduled run would.
+export async function rerunWorkflowRun(runId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/workflows/runs/${encodeURIComponent(runId)}/rerun`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(typeof body?.detail === "string" ? body.detail : `Failed to run it again: ${res.statusText}`);
+  }
 }
 
 // Undo for an autonomous close / expiry / dismiss: back to the live queue.
@@ -4713,6 +4824,27 @@ export interface DecisionInstance {
   external_event_id: string | null;
   reversal_reason: string | null;
   severity: string;
+}
+
+// Approve a proposal card that has no decision behind it: the server records
+// who approved it, claims it and carries it out (alerts/approvals.py).
+export async function approveAlert(alertId: number, editedBody?: string): Promise<AlertApproval> {
+  const res = await fetch(`${API_BASE}/alerts/${alertId}/approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ edited_body: editedBody ?? null }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Failed to approve: ${res.statusText}${text ? ` — ${text}` : ""}`);
+  }
+  return res.json();
+}
+
+export async function getAlertApproval(approvalId: number): Promise<AlertApproval> {
+  const res = await fetch(`${API_BASE}/alerts/approvals/${approvalId}`);
+  if (!res.ok) throw new Error(`Failed to read approval ${approvalId}: ${res.statusText}`);
+  return res.json();
 }
 
 export async function approveDecision(
@@ -5091,6 +5223,33 @@ export async function getLeadCard(id: number, signal?: AbortSignal): Promise<Lea
     kind: String(payload.kind ?? ""),
     fields: Array.isArray(payload.fields) ? payload.fields : [],
     allow: payload.allow && typeof payload.allow.key === "string" ? payload.allow : undefined,
+  };
+}
+
+// What a team member's held chat action holds (a department_action
+// decision): who asked, why it waited, and every field of the call in full.
+// Only its approver and the owner can read it.
+export interface HeldActionPayload {
+  summary: string;
+  reason: string;
+  requestedBy: string;
+  details: { field: string; value: string }[];
+}
+
+export async function getHeldAction(id: number, signal?: AbortSignal): Promise<HeldActionPayload> {
+  const res = await fetch(`${API_BASE}/decisions/${id}`, { signal });
+  if (!res.ok) throw await leadError(res, "Couldn't load this card.");
+  const instance: DecisionInstance = await res.json();
+  const payload = JSON.parse(instance.proposed_payload_json || "{}");
+  const details = Array.isArray(payload.details) ? payload.details : [];
+  return {
+    summary: String(payload.summary ?? ""),
+    reason: String(payload.reason ?? ""),
+    requestedBy: String(payload.requested_by ?? ""),
+    details: details.map((d: { field?: unknown; value?: unknown }) => ({
+      field: String(d.field ?? ""),
+      value: String(d.value ?? ""),
+    })),
   };
 }
 

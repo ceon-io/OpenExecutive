@@ -192,6 +192,9 @@ class ProposalItem(BaseModel):
     # the /decisions endpoints (which book/cancel server-side) instead of the
     # ack-and-handoff-to-chat flow. Null for ordinary alert-backed proposals.
     decision_instance_id: int | None = None
+    # A scheduled run that failed (workflows/failure_alerts.py): the run the
+    # card's Run again queues once more. None on every other card.
+    failed_run_id: str | None = None
     # Set when this card is a roster request ("who is this new sender?",
     # people.roster_requests): the UI answers it at /people/requests/{id}
     # (add / same person as / ignore) instead of ack-and-chat. Private to the
@@ -464,6 +467,17 @@ class HandledItem(BaseModel):
     status: str = ""
 
 
+class HeldBackItem(BaseModel):
+    """Lines grounding left out of one of the principal's briefs (the
+    "Left out of your brief" block on Home, which the brief's note names)."""
+
+    event_id: int
+    # "morning brief" / "end-of-day digest"
+    surface: str
+    at: str
+    lines: list[str]
+
+
 class TodayResponse(BaseModel):
     departments: list[DepartmentBriefItem]
     people: list[PersonBriefItem]
@@ -497,6 +511,19 @@ class TodayResponse(BaseModel):
     # (routed / nudged / escalated / drafted / merged / closed), newest first
     # — the "Executive handled N overnight" pill. Additive, default empty.
     handled_overnight: list[HandledItem] = Field(default_factory=list)
+    # What grounding held back from the principal's briefs in the last day.
+    # Set by GET /today for the principal alone, after the narrative inputs
+    # are taken, so the held lines never reach a prompt.
+    held_back: list[HeldBackItem] = Field(default_factory=list)
+    # The install's first week (``briefing.first_week``): the header opens
+    # with getting-started moves, so the page doesn't call the day quiet.
+    first_week: bool = False
+
+
+def _first_week_header(context: str) -> bool:
+    from openexecutive.briefing.first_week import HEADER
+
+    return HEADER in context
 
 
 class ActivityItem(BaseModel):
@@ -792,6 +819,8 @@ def _build_today(
     from openexecutive.alerts.lifecycle import list_live_alerts
     from openexecutive.alerts.store import count_superseded_by
     from openexecutive.briefing.ranking import score_and_categorize
+    from openexecutive.workflows.failure_alerts import SOURCE as FAILED_RUN_SOURCE
+    from openexecutive.workflows.failure_alerts import failed_run_id
 
     # Live = unread AND inside its TTL AND not snoozed — the read-side twin of
     # the scheduler's expiry sweep, so the page is right before the sweep runs.
@@ -838,6 +867,11 @@ def _build_today(
             category=item_category,
             surfaced_reason=item_reason,
             decision_instance_id=_parse_decision_instance_id(alert.topic_tags or []),
+            failed_run_id=(
+                failed_run_id(alert.topic_tags or [])
+                if alert.source == FAILED_RUN_SOURCE
+                else None
+            ),
             roster_request=(
                 _roster_request_card(alert.topic_tags or [])
                 if alert.source == "roster_request" else None
@@ -1003,6 +1037,7 @@ def _resolve_channel_target(
 
 # Held Take the lead actions (orchestrator.take_the_lead.DECISION_CLASS).
 TAKE_THE_LEAD_CLASS = "take_the_lead_action"
+DEPARTMENT_ACTION_CLASS = "department_action"
 
 # Terminal decision-instance status → human verb for the activity rail.
 _DECISION_STATUS_LABEL = {
@@ -1219,6 +1254,8 @@ def _build_activity(
             continue  # a meeting with one of the principal's contacts
         if instance.decision_class == TAKE_THE_LEAD_CLASS:
             continue  # its card quotes the message: the Take the lead rows below say what it did
+        if instance.decision_class == DEPARTMENT_ACTION_CLASS:
+            continue  # it quotes a teammate's conversation; the audit log keeps who approved it
         label = _DECISION_STATUS_LABEL.get(instance.status, "Resolved")
         detail = (
             _payload_headline(instance.final_payload_json)
@@ -1582,7 +1619,8 @@ def _narrative_context(
 
     The whole-company scopes (``principal`` / ``company``) also get the live
     blocks (`_header_live`) — what came in today, what is stuck, the rest of
-    the calendar — private rows only in the principal's own scope. A
+    the calendar — private rows only in the principal's own scope, and in
+    the first week the GETTING STARTED block (``briefing.first_week``). A
     teammate's header is unchanged.
 
     On a quiet board — nothing awaiting a decision and nothing live — it
@@ -1598,11 +1636,22 @@ def _narrative_context(
     live = None
     window = "today so far"
     now_label: str | None = None
+    getting_started = ""
     if viewer_desc is None:
         live, window, now_label = _header_live(
             include_private=scope == narrative_cache.DEFAULT_SCOPE
         )
-    if _nothing_needs_attention(today_data, mode) and (live is None or live.is_empty()):
+        # The first week: goals and departments with no leader, so a new
+        # install's header has something to say (never the owner's own inbox
+        # here; the header's hot path reads no mailbox).
+        from openexecutive.briefing.first_week import getting_started_shared
+
+        getting_started = getting_started_shared(solo=mode == "solo").text
+    if (
+        _nothing_needs_attention(today_data, mode)
+        and (live is None or live.is_empty())
+        and not getting_started
+    ):
         return narrative_cache.QUIET_CONTEXT, None
     activity = _narrative_activity(viewer, viewer_desc)
     context = render_briefing_context(
@@ -1613,6 +1662,7 @@ def _narrative_context(
         live=live,
         live_window=window,
         now_label=now_label,
+        getting_started=getting_started,
     )
     return context, activity
 
@@ -1667,6 +1717,9 @@ def _attach_narrative(
     try:
         mode = get_workspace().mode
         context, _activity = _narrative_context(today_data, viewer, desc, mode, scope)
+        # The "Quiet day" banner gives way only to a header that carries
+        # GETTING STARTED (the principal's or the company's, with something in it).
+        response.first_week = _first_week_header(context)
         nhash = narrative_cache.build_narrative_input_hash(context, scope=scope, mode=mode)
         cached = narrative_cache.get(scope)
         is_stale = cached is None or cached.input_hash != nhash
@@ -1860,9 +1913,10 @@ async def get_today(request: Request, background_tasks: BackgroundTasks) -> Toda
     from openexecutive.orchestrator.artifact_records import viewer_for_person
 
     caller = _resolve_caller_person_id(request)
+    principal = _is_principal(caller)
     response = _build_today(
         stale_out=stale,
-        include_private=_is_principal(caller),
+        include_private=principal,
         viewer=viewer_for_person(caller),
     )
     response.caller_person_id = caller
@@ -1873,7 +1927,24 @@ async def get_today(request: Request, background_tasks: BackgroundTasks) -> Toda
         caller_person_id=response.caller_person_id,
         background_tasks=background_tasks,
     )
+    if principal:
+        response.held_back = _held_back(datetime.now(UTC))
     return response
+
+
+# How far back Home lists what grounding left out of the briefs: today's
+# morning brief and last night's digest.
+_HELD_BACK_WINDOW = timedelta(hours=24)
+
+
+def _held_back(now: datetime) -> list[HeldBackItem]:
+    from openexecutive.briefing.grounding import recent_held_back
+
+    since = (now - _HELD_BACK_WINDOW).isoformat()
+    return [
+        HeldBackItem(event_id=h.event_id, surface=h.surface, at=h.at, lines=h.lines)
+        for h in recent_held_back(since=since)
+    ]
 
 
 @router.get("/today/activity", response_model=ActivityResponse, tags=["today"])
@@ -1963,13 +2034,13 @@ class BriefDeliveryNotice(BaseModel):
 
 def _brief_delivery_notice() -> BriefDeliveryNotice | None:
     from openexecutive.briefing.brief_state import (
-        DELIVERY_PROBLEMS,
         brief_name,
         current_problem,
+        describe_problem,
         last_delivery_outcome,
     )
     from openexecutive.config import get_settings
-    from openexecutive.scheduler.runner import principal_delivery_plan
+    from openexecutive.scheduler.runner import mail_gateway_problem, principal_delivery_plan
 
     # With the scheduler off no brief is coming; the Setup status page says so.
     if not get_settings().scheduler_enabled:
@@ -1978,10 +2049,16 @@ def _brief_delivery_notice() -> BriefDeliveryNotice | None:
     if last is None:
         return None
     principal, plan = principal_delivery_plan()
-    reason = current_problem(last, has_owner=principal is not None, can_deliver=bool(plan))
+    blocked = mail_gateway_problem(principal)
+    reason = current_problem(
+        last, has_owner=principal is not None, can_deliver=bool(plan),
+        gateway_down=blocked is not None,
+    )
     if reason is None:
         return None
-    problem, fix = DELIVERY_PROBLEMS[reason]
+    problem, fix = describe_problem(
+        reason, blocked if reason == "gateway_down" else last.detail
+    )
     return BriefDeliveryNotice(
         brief=brief_name(last.kind),
         at=last.at.isoformat(),
