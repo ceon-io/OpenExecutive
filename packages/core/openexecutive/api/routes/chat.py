@@ -646,14 +646,27 @@ def forget_session(session_id: str) -> bool:
     return had_starter or had_session
 
 
-def _get_or_create_session(session_id: str | None, request: Request) -> Any:
+async def _get_or_create_session(session_id: str | None, request: Request) -> Any:
     from openexecutive.memory.session_store import load_messages
     from openexecutive.onboarding.profile_builder import load_or_create_profile
     from openexecutive.orchestrator.session import Session
 
     session_id = _clean_session_id(session_id)
     if session_id and session_id in _sessions:
-        return _sessions[session_id]
+        cached = _sessions[session_id]
+        # The stored transcript, not the cached one, is the conversation: a
+        # chat app's turns in the same conversation (a Telegram or Slack chat
+        # continued on the web, then back in the app) are saved by its adapter
+        # and never reach this cache. Without the re-read, going back to the
+        # chat here answers as though those turns never happened. Runs under
+        # the conversation's turn lock, so the previous turn here is saved.
+        # Off the event loop: a long transcript is a real read on every turn.
+        # A failed read keeps the live history rather than failing the turn.
+        try:
+            cached.conversation_history = await asyncio.to_thread(load_messages, session_id)
+        except Exception:
+            logger.exception("chat.history_reload_failed session_id=%s", session_id)
+        return cached
 
     new_id = session_id or str(uuid.uuid4())
     profile = load_or_create_profile()
@@ -665,7 +678,7 @@ def _get_or_create_session(session_id: str | None, request: Request) -> Any:
 
     if session_id:
         # Server may have restarted — reload history from DB so conversation continues.
-        history = load_messages(session_id)
+        history = await asyncio.to_thread(load_messages, session_id)
         if history:
             session.conversation_history = history
 
@@ -971,7 +984,7 @@ async def _run_chat_turn(
             _release_stop(client_turn_id, turn_id)
             raise
     try:
-        session = _get_or_create_session(requested_id, request)
+        session = await _get_or_create_session(requested_id, request)
     except BaseException:
         _release_stop(client_turn_id, turn_id)
         if lock_key is not None:
@@ -1350,11 +1363,9 @@ async def _run_chat_turn(
                 # The Executive's own post-turn block (executive.py, after its
                 # `async for`) is what normally mirrors the turn into the live
                 # in-memory Session. On every broken-out path it is skipped,
-                # because the generator is closed at its yield — and
-                # `_get_or_create_session` never re-reads history for a session
-                # already in `_sessions`. Without this the NEXT turn in this
-                # process would build its prompt as though the stopped turn had
-                # never happened, while a page reload showed it.
+                # because the generator is closed at its yield. Without this the
+                # live Session would disagree with what was just saved until
+                # the next turn re-read it.
                 if stopped or client_disconnected or timed_out:
                     session.add_user_message(message)
                     for added_text in added_texts:
